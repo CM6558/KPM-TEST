@@ -35,6 +35,21 @@ extern unsigned long msecs_to_jiffies(unsigned int m);
 #define GFP_KERNEL 0
 #endif
 
+/* KernelPatch stubs don't declare these — add minimal declarations */
+extern void rcu_read_lock(void);
+extern void rcu_read_unlock(void);
+extern void get_task_struct(void *tsk);
+extern void put_task_struct(void *tsk);
+extern long simple_strtol(const char *cp, char **endp, unsigned int base);
+extern unsigned long simple_strtoul(const char *cp, char **endp, unsigned int base);
+extern int snprintf(char *str, unsigned long size, const char *fmt, ...);
+#ifndef min
+#define min(a,b) ((a) < (b) ? (a) : (b))
+#endif
+#ifndef NULL
+#define NULL ((void*)0)
+#endif
+
 KPM_NAME("hero-reader");
 KPM_VERSION("3.0.1");
 KPM_LICENSE("GPL v2");
