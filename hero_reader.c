@@ -16,8 +16,24 @@
 #include <ksyms.h>
 #include <kstorage.h>
 #include <linux/sched.h>
-#include <linux/timer.h>
 #include <linux/slab.h>
+
+/* KernelPatch 不提供 linux/timer.h, 自行声明需要的类型和函数 */
+struct timer_list {
+    struct hlist_node entry;
+    unsigned long expires;
+    void (*function)(struct timer_list *);
+    unsigned int flags;
+    /* 其余字段不使用, 省略 */
+};
+extern void timer_setup(struct timer_list *timer, void (*func)(struct timer_list *), unsigned int flags);
+extern int mod_timer(struct timer_list *timer, unsigned long expires);
+extern int del_timer_sync(struct timer_list *timer);
+extern unsigned long jiffies;
+extern unsigned long msecs_to_jiffies(unsigned int m);
+#ifndef GFP_KERNEL
+#define GFP_KERNEL 0
+#endif
 
 KPM_NAME("hero-reader");
 KPM_VERSION("3.0.1");
@@ -89,10 +105,6 @@ static void reader_timer_fn(struct timer_list *t);
  * ============================================================ */
 
 static struct timer_list g_timer;
-
-/* ============================================================
- * 底层: 内核态跨进程内存读取
- * ============================================================ */
 
 static long read_remote(unsigned long addr, void *buf, int len)
 {
