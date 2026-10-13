@@ -1,8 +1,11 @@
 /*
- * hero_reader.kpm — 王者荣耀英雄坐标内核级全自动读取 v3.0
+ * hero_reader.kpm — 王者荣耀英雄坐标内核级全自动读取 v3.2
  *
  * 零用户态操作: KPM 加载后自动发现游戏进程 + 定位基址 + 周期读取
  * 结果通过内核日志输出: dmesg | grep hero-reader
+ *
+ * API 参照: bmax121/KernelPatch doc/zh-CN/module.md + hook.h + ksyms.h
+ * 仅使用 KP 导出符号 + kallsyms_lookup_name 动态获取内核函数
  *
  * 偏移来源: IDA Pro 反编译 libil2cpp.so + libGameCore.so 确认
  */
@@ -16,56 +19,12 @@
 #include <ksyms.h>
 #include <kstorage.h>
 #include <linux/sched.h>
-#include <linux/slab.h>
-
-/* KernelPatch 不提供 linux/timer.h, 自行声明需要的类型和函数 */
-struct timer_list {
-    struct hlist_node entry;
-    unsigned long expires;
-    void (*function)(struct timer_list *);
-    unsigned int flags;
-    /* 其余字段不使用, 省略 */
-};
-extern void timer_setup(struct timer_list *timer, void (*func)(struct timer_list *), unsigned int flags);
-extern int mod_timer(struct timer_list *timer, unsigned long expires);
-extern int del_timer_sync(struct timer_list *timer);
-extern unsigned long jiffies;
-extern unsigned long msecs_to_jiffies(unsigned int m);
-#ifndef GFP_KERNEL
-#define GFP_KERNEL 0
-#endif
-
-/* KernelPatch stubs don't declare these — add minimal declarations */
-extern void rcu_read_lock(void);
-extern void rcu_read_unlock(void);
-extern void get_task_struct(void *tsk);
-extern void put_task_struct(void *tsk);
-extern long simple_strtol(const char *cp, char **endp, unsigned int base);
-extern unsigned long simple_strtoul(const char *cp, char **endp, unsigned int base);
-extern int snprintf(char *str, unsigned long size, const char *fmt, ...);
-#ifndef min
-#define min(a,b) ((a) < (b) ? (a) : (b))
-#endif
-#ifndef NULL
-#define NULL ((void*)0)
-#endif
 
 KPM_NAME("hero-reader");
-KPM_VERSION("3.0.1");
+KPM_VERSION("3.2.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("analyst");
 KPM_DESCRIPTION("Zero-userspace hero position kernel reader");
-
-/* ============================================================
- * 内核函数指针
- * ============================================================ */
-
-static long  (*p_access_process_vm)(void *tsk, unsigned long addr,
-                                     void *buf, int len, unsigned int gup_flags);
-static void* (*p_find_task_by_vpid)(pid_t vnr);
-static void* (*p_get_task_mm)(void *tsk);
-static void  (*p_mmput)(void *mm);
-static void* (*p_find_vma)(void *mm, unsigned long addr);
 
 /* ============================================================
  * 偏移量 (IDA 反编译确认)
@@ -81,6 +40,36 @@ static void* (*p_find_vma)(void *mm, unsigned long addr);
 #define ACTOR_POS_Y               0x28
 #define MAX_HEROES                 10
 
+#ifndef min
+#define min(a,b) ((a) < (b) ? (a) : (b))
+#endif
+
+/* ============================================================
+ * 内核函数指针 (全部通过 kallsyms_lookup_name 获取)
+ * 这些不是 KP 导出符号, 必须动态查找
+ * ============================================================ */
+
+static long  (*p_access_process_vm)(void *tsk, unsigned long addr,
+                                     void *buf, int len, unsigned int gup_flags);
+static void* (*p_find_task_by_vpid)(pid_t vnr);
+static void* (*p_get_task_mm)(void *tsk);
+static void  (*p_mmput)(void *mm);
+static void* (*p_find_vma)(void *mm, unsigned long addr);
+static void  (*p_rcu_read_lock)(void);
+static void  (*p_rcu_read_unlock)(void);
+static void  (*p_get_task_struct)(void *tsk);
+static void  (*p_put_task_struct)(void *tsk);
+
+/* 定时器: 用 kthread 代替 timer_list (更安全, 不需要 struct timer_list 声明) */
+static long  (*p_kthread_run)(long (*fn)(void *), void *data, const char *name);
+static int   (*p_kthread_should_stop)(void);
+static void  (*p_kthread_stop)(void *k);
+static void  (*p_msleep)(unsigned int msecs);
+static long (*p_simple_strtol)(const char *cp, char **endp, unsigned int base);
+static unsigned long (*p_simple_strtoul)(const char *cp, char **endp, unsigned int base);
+
+static void *g_kthread = NULL;
+
 /* ============================================================
  * 全局状态
  * ============================================================ */
@@ -92,17 +81,17 @@ static unsigned long  g_actor_end      = 0;
 static int            g_hook_active    = 0;
 static int            g_reader_active  = 0;
 
-struct hero_snapshot {
-    int valid;
-    int count;
-    struct {
-        int index;
-        int camp;
-        int x, y, z;
-    } heroes[MAX_HEROES];
+struct hero_info {
+    int index;
+    int camp;
+    int x, y, z;
 };
 
-static struct hero_snapshot g_snapshot = {0};
+static struct {
+    int valid;
+    int count;
+    struct hero_info heroes[MAX_HEROES];
+} g_snapshot = {0};
 
 /* ============================================================
  * 前向声明
@@ -113,13 +102,11 @@ static int r_str_remote(unsigned long addr, char *buf, int maxlen, void *tsk);
 static unsigned long find_il2cpp_base(void *tsk);
 static int discover_actor_by_pattern(void);
 static void read_hero_positions(void);
-static void reader_timer_fn(struct timer_list *t);
+static long reader_thread(void *data);
 
 /* ============================================================
- * 定时器 (用 kfunc 导出的 timer_setup / mod_timer / del_timer_sync)
+ * 底层: 内核态跨进程内存读取
  * ============================================================ */
-
-static struct timer_list g_timer;
 
 static long read_remote(unsigned long addr, void *buf, int len)
 {
@@ -129,18 +116,18 @@ static long read_remote(unsigned long addr, void *buf, int len)
     if (!g_target_pid || !p_find_task_by_vpid || !p_access_process_vm)
         return -1;
 
-    rcu_read_lock();
+    p_rcu_read_lock();
     tsk = p_find_task_by_vpid(g_target_pid);
     if (tsk)
-        get_task_struct(tsk);
-    rcu_read_unlock();
+        p_get_task_struct(tsk);
+    p_rcu_read_unlock();
 
     if (!tsk)
         return -1;
 
     ret = p_access_process_vm(tsk, addr, buf, len, 0x10);
 
-    put_task_struct(tsk);
+    p_put_task_struct(tsk);
     return ret;
 }
 
@@ -150,7 +137,6 @@ static int r_u64(unsigned long addr, unsigned long *v)
 static int r_i32(unsigned long addr, int *v)
 { return read_remote(addr, v, 4) == 4; }
 
-/* 指定 task 的内存读取 */
 static int r_u64_remote(unsigned long addr, unsigned long *val, void *tsk)
 {
     return p_access_process_vm(tsk, addr, val, 8, 0x10) == 8;
@@ -173,13 +159,12 @@ static int r_str_remote(unsigned long addr, char *buf, int maxlen, void *tsk)
 
 /* ============================================================
  * Step 1: 内核态自动定位 libil2cpp.so 基址
+ * 遍历目标进程 VMA 链表, 匹配文件名
  * ============================================================ */
 
-/* VMA 结构体偏移 (Linux 5.x ARM64) */
 #define VMA_VM_START    0x00
 #define VMA_VM_NEXT     0x10
 #define VMA_VM_FILE     0x28
-
 #define FILE_DENTRY     0x18
 #define DENTRY_D_NAME_NAME (0x28 + 8)
 
@@ -187,7 +172,7 @@ static unsigned long find_il2cpp_base(void *tsk)
 {
     void *mm;
     unsigned long vma_addr, file_addr, dentry_addr, name_addr;
-    unsigned long vm_start, vm_next;
+    unsigned long vm_start = 0, vm_next = 0;
     char name_buf[64];
     unsigned long base = 0;
 
@@ -241,7 +226,7 @@ static unsigned long find_il2cpp_base(void *tsk)
 
 static int discover_actor_by_pattern(void)
 {
-    pr_warn("[hero-reader] pattern scan placeholder — use ctl0 to set actors\n");
+    pr_warn("[hero-reader] pattern scan placeholder\n");
     return 0;
 }
 
@@ -256,14 +241,14 @@ static void read_hero_positions(void)
     if (!g_actor_begin || !g_actor_end) {
         if (!g_libil2cpp_base) {
             void *tsk;
-            rcu_read_lock();
+            p_rcu_read_lock();
             tsk = p_find_task_by_vpid(g_target_pid);
             if (tsk)
-                get_task_struct(tsk);
-            rcu_read_unlock();
+                p_get_task_struct(tsk);
+            p_rcu_read_unlock();
             if (tsk) {
                 g_libil2cpp_base = find_il2cpp_base(tsk);
-                put_task_struct(tsk);
+                p_put_task_struct(tsk);
             }
         }
         if (g_libil2cpp_base && !g_actor_begin)
@@ -316,37 +301,44 @@ static void read_hero_positions(void)
 }
 
 /* ============================================================
- * Step 4: 内核定时器
+ * Step 4: 内核线程 — 自主周期读取
+ * 用 kthread 代替 timer_list, 避免结构体声明问题
  * ============================================================ */
 
-static void reader_timer_fn(struct timer_list *t)
+static long reader_thread(void *data)
 {
-    if (g_target_pid) {
-        void *tsk;
-        rcu_read_lock();
-        tsk = p_find_task_by_vpid(g_target_pid);
-        if (tsk)
-            get_task_struct(tsk);
-        rcu_read_unlock();
+    pr_info("[hero-reader] kthread started\n");
 
-        if (tsk) {
-            if (!g_libil2cpp_base)
-                g_libil2cpp_base = find_il2cpp_base(tsk);
-            put_task_struct(tsk);
-        } else {
-            pr_warn("[hero-reader] target pid %d gone\n", g_target_pid);
-            g_target_pid = 0;
-            g_libil2cpp_base = 0;
-            g_actor_begin = 0;
-            g_actor_end = 0;
+    while (!p_kthread_should_stop()) {
+        if (g_target_pid) {
+            void *tsk;
+            p_rcu_read_lock();
+            tsk = p_find_task_by_vpid(g_target_pid);
+            if (tsk)
+                p_get_task_struct(tsk);
+            p_rcu_read_unlock();
+
+            if (tsk) {
+                if (!g_libil2cpp_base)
+                    g_libil2cpp_base = find_il2cpp_base(tsk);
+                p_put_task_struct(tsk);
+            } else {
+                pr_warn("[hero-reader] target pid %d gone\n", g_target_pid);
+                g_target_pid = 0;
+                g_libil2cpp_base = 0;
+                g_actor_begin = 0;
+                g_actor_end = 0;
+            }
         }
+
+        if (g_target_pid)
+            read_hero_positions();
+
+        p_msleep(500);
     }
 
-    if (g_target_pid)
-        read_hero_positions();
-
-    if (g_reader_active)
-        mod_timer(&g_timer, jiffies + msecs_to_jiffies(500));
+    pr_info("[hero-reader] kthread exiting\n");
+    return 0;
 }
 
 /* ============================================================
@@ -381,7 +373,7 @@ static void after_access_vm(hook_fargs5_t *args, void *udata)
                 pr_info("[hero-reader] libil2cpp base = %lx\n", g_libil2cpp_base);
                 if (!g_reader_active) {
                     g_reader_active = 1;
-                    mod_timer(&g_timer, jiffies + msecs_to_jiffies(1000));
+                    g_kthread = (void *)p_kthread_run(reader_thread, NULL, "hero_reader");
                 }
             }
         }
@@ -397,28 +389,49 @@ static long hero_reader_init(const char *args, const char *event, void *reserved
     void *func;
     hook_err_t err;
 
-    pr_info("[hero-reader] v3.0.1 init, event=%s\n", event);
+    pr_info("[hero-reader] v3.2 init, event=%s\n", event);
 
-    p_access_process_vm = (void *)kallsyms_lookup_name("access_process_vm");
-    p_find_task_by_vpid = (void *)kallsyms_lookup_name("find_task_by_vpid");
-    p_get_task_mm       = (void *)kallsyms_lookup_name("get_task_mm");
-    p_mmput             = (void *)kallsyms_lookup_name("mmput");
-    p_find_vma          = (void *)kallsyms_lookup_name("find_vma");
+    /* KP 导出符号 — 直接可用 */
+    /* kallsyms_lookup_name, pr_info, memcpy, strstr, compat_copy_to_user, etc. */
 
-    if (!p_access_process_vm || !p_find_task_by_vpid) {
-        pr_err("[hero-reader] FATAL: kernel symbols not found\n");
+    /* 非 KP 导出的内核函数 — 通过 kallsyms_lookup_name 获取 */
+    #define KSYM(name) p_##name = (void *)kallsyms_lookup_name(#name); \
+        if (!p_##name) { pr_err("[hero-reader] FATAL: " #name " not found\n"); return -1; }
+
+    KSYM(access_process_vm);
+    KSYM(find_task_by_vpid);
+    KSYM(get_task_mm);
+    KSYM(mmput);
+    KSYM(rcu_read_lock);
+    KSYM(rcu_read_unlock);
+    KSYM(get_task_struct);
+    KSYM(put_task_struct);
+
+    /* 可选符号 — find_vma 可能在某些内核不存在 */
+    p_find_vma = (void *)kallsyms_lookup_name("find_vma");
+    if (!p_find_vma) {
+        pr_warn("[hero-reader] find_vma not found, VMA scan disabled\n");
+    }
+
+    /* kthread 函数 */
+    p_kthread_run = (void *)kallsyms_lookup_name("kthread_run");
+    p_kthread_should_stop = (void *)kallsyms_lookup_name("kthread_should_stop");
+    p_kthread_stop = (void *)kallsyms_lookup_name("kthread_stop");
+    p_msleep = (void *)kallsyms_lookup_name("msleep");
+    if (!p_kthread_run || !p_kthread_should_stop || !p_kthread_stop || !p_msleep) {
+        pr_err("[hero-reader] FATAL: kthread symbols not found\n");
         return -1;
     }
-    pr_info("[hero-reader] access_process_vm=%lx find_task_by_vpid=%lx\n",
-            (unsigned long)p_access_process_vm,
-            (unsigned long)p_find_task_by_vpid);
 
-    timer_setup(&g_timer, reader_timer_fn, 0);
+    /* simple_strtol/strtoul */
+    p_simple_strtol = (void *)kallsyms_lookup_name("simple_strtol");
+    p_simple_strtoul = (void *)kallsyms_lookup_name("simple_strtoul");
 
-    /* hook access_process_vm (5 params)
-     * hook_wrap5 signature: (func, argno, before, after, udata) */
+    pr_info("[hero-reader] all symbols resolved\n");
+
+    /* hook access_process_vm (5 params) */
     func = (void *)p_access_process_vm;
-    err = hook_wrap(func, 5, NULL, after_access_vm, NULL);
+    err = hook_wrap5(func, NULL, after_access_vm, NULL);
     if (err != HOOK_NO_ERR) {
         pr_err("[hero-reader] hook failed: %d\n", err);
         return -1;
@@ -426,11 +439,16 @@ static long hero_reader_init(const char *args, const char *event, void *reserved
     g_hook_active = 1;
     pr_info("[hero-reader] hooked access_process_vm\n");
 
-    if (args && *args) {
-        g_target_pid = simple_strtol(args, NULL, 10);
+    /* 如果 init args 传入了 PID, 直接用 */
+    if (args && *args && p_simple_strtol) {
+        g_target_pid = (pid_t)p_simple_strtol(args, NULL, 10);
         pr_info("[hero-reader] target pid from args: %d\n", g_target_pid);
+    }
+
+    /* 如果已有 target_pid, 启动 kthread */
+    if (g_target_pid && !g_reader_active) {
         g_reader_active = 1;
-        mod_timer(&g_timer, jiffies + msecs_to_jiffies(1000));
+        g_kthread = (void *)p_kthread_run(reader_thread, NULL, "hero_reader");
     }
 
     pr_info("[hero-reader] initialized — dmesg | grep hero-reader\n");
@@ -440,17 +458,25 @@ static long hero_reader_init(const char *args, const char *event, void *reserved
 static long hero_reader_exit(void *reserved)
 {
     pr_info("[hero-reader] exit\n");
-    g_reader_active = 0;
-    del_timer_sync(&g_timer);
 
+    g_reader_active = 0;
+
+    /* 停止 kthread */
+    if (g_kthread) {
+        p_kthread_stop(g_kthread);
+        g_kthread = NULL;
+    }
+
+    /* 卸载 hook */
     if (g_hook_active) {
         hook_unwrap((void *)p_access_process_vm, NULL, after_access_vm);
         g_hook_active = 0;
     }
+
     return 0;
 }
 
-/* ctl0: 调试/可选交互, 正常运行不需要 */
+/* ctl0: 可选调试接口, 正常运行不需要 */
 static long hero_reader_ctl0(const char *args, char *__user out_msg, int outlen)
 {
     char response[256];
@@ -479,14 +505,14 @@ static long hero_reader_ctl0(const char *args, char *__user out_msg, int outlen)
         } else {
             snprintf(response, sizeof(response), "no data");
         }
-    } else if (!strncmp(args, "pid ", 4)) {
-        g_target_pid = simple_strtol(args + 4, NULL, 10);
+    } else if (!strncmp(args, "pid ", 4) && p_simple_strtol) {
+        g_target_pid = (pid_t)p_simple_strtol(args + 4, NULL, 10);
         snprintf(response, sizeof(response), "pid=%d", g_target_pid);
-    } else if (!strncmp(args, "actors ", 7)) {
+    } else if (!strncmp(args, "actors ", 7) && p_simple_strtoul) {
         const char *p = args + 7;
-        g_actor_begin = simple_strtoul(p, &p, 16);
+        g_actor_begin = p_simple_strtoul(p, (char **)&p, 16);
         while (*p == ' ') p++;
-        g_actor_end = simple_strtoul(p, NULL, 16);
+        g_actor_end = p_simple_strtoul(p, NULL, 16);
         snprintf(response, sizeof(response),
                  "actors=%lx-%lx", g_actor_begin, g_actor_end);
     } else {
