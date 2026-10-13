@@ -44,6 +44,15 @@ KPM_DESCRIPTION("Zero-userspace hero position kernel reader");
 #define min(a,b) ((a) < (b) ? (a) : (b))
 #endif
 
+/* snprintf — documented as available via <linux/string.h> kfunc,
+ * but NDK clang C99 needs explicit declaration */
+extern int snprintf(char *str, unsigned long size, const char *fmt, ...);
+
+/* strncmp — from <linux/string.h> */
+extern int strncmp(const char *s1, const char *s2, unsigned long n);
+/* strlen — from <linux/string.h> */
+extern unsigned long strlen(const char *s);
+
 /* ============================================================
  * 内核函数指针 (全部通过 kallsyms_lookup_name 获取)
  * 这些不是 KP 导出符号, 必须动态查找
