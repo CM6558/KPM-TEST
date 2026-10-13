@@ -14,17 +14,19 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Clone KernelPatch
-        run: git clone --depth=1 https://github.com/bmax121/KernelPatch.git KernelPatch
+      - name: Set up NDK
+        uses: nttld/setup-ndk@v1
+        id: setup_ndk
+        with:
+          ndk-version: r27c
+          add-to-path: false
 
-      - name: Install aarch64 cross compiler
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+      - name: Clone SukiSU KernelPatch
+        run: git clone --depth=1 https://github.com/ShirkNeko/SukiSU_KernelPatch_patch.git KernelPatch
 
       - name: Build
         env:
-          TARGET_COMPILE: aarch64-linux-gnu-
+          NDK_PATH: ${{ steps.setup_ndk.outputs.ndk-path }}
           KP_DIR: ${{ github.workspace }}/KernelPatch
         run: make
 
