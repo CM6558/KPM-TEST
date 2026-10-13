@@ -1,34 +1,43 @@
-# KernelPatch Module Makefile
-# Build: make
-# Output: hero_reader.kpm
+# KPM Makefile — aligned with official KernelPatch demo Makefile structure
+# Usage:
+#   export TARGET_COMPILE=aarch64-none-elf-
+#   export KP_DIR=/path/to/KernelPatch
+#   make
 
-# Toolchain — 需要裸机 ARM64 交叉编译器
-# 安装: sudo apt install gcc-aarch64-linux-gnu
-# 或用 NDK: export CC=aarch64-linux-android24-clang
-CC ?= aarch64-linux-gnu-gcc
+ifndef TARGET_COMPILE
+    TARGET_COMPILE ?= aarch64-linux-gnu-
+endif
 
-# KernelPatch source root (clone from github.com/bmax121/KernelPatch)
-KP_ROOT ?= $(HOME)/KernelPatch
+ifndef KP_DIR
+    KP_DIR ?= $(HOME)/KernelPatch
+endif
 
-# Include paths
+CC = $(TARGET_COMPILE)gcc
+
+INCLUDE_DIRS := . include patch/include linux/include linux/arch/arm64/include linux/tools/arch/arm64/include
+INCLUDE_FLAGS := $(foreach dir,$(INCLUDE_DIRS),-I$(KP_DIR)/kernel/$(dir))
+
 CFLAGS := -nostdlib -nostartfiles -ffreestanding -fno-stack-protector \
           -fno-common -fno-builtin -fno-asynchronous-unwind-tables \
-          -fno-omit-frame-pointer -Wall -Wextra -O2 \
-          -I$(KP_ROOT)/kernel/include \
-          -I$(KP_ROOT)/kernel/patch/include \
-          -I$(KP_ROOT)/kernel/patch/include/uapi \
-          -I$(KP_ROOT)/kernel/patch/include/linux
+          -fno-omit-frame-pointer -Wall -Wextra -O2
 
-LDFLAGS := -r -e init
-
-# Target
 TARGET := hero_reader.kpm
 SRC := hero_reader.c
 
+all: $(TARGET)
+
 $(TARGET): $(SRC)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
+	$(CC) $(CFLAGS) $(INCLUDE_FLAGS) -r -o $@ $<
+
+# Linker script to suppress unwanted sections
+hero_reader.lds:
+	@echo "SECTIONS {" > $@
+	@echo "  .plt (NOLOAD) : { BYTE(0) }" >> $@
+	@echo "  .init.plt (NOLOAD) : { BYTE(0) }" >> $@
+	@echo "  .text.ftrace_trampoline (NOLOAD) : { BYTE(0) }" >> $@
+	@echo "}" >> $@
 
 clean:
-	rm -f $(TARGET)
+	rm -f *.kpm *.o *.lds
 
 .PHONY: clean
