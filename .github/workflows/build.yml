@@ -15,19 +15,17 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Clone KernelPatch
-        run: |
-          git clone --depth=1 https://github.com/bmax121/KernelPatch.git ~/KernelPatch
-          echo "KP_ROOT=$HOME/KernelPatch" >> $GITHUB_ENV
+        run: git clone --depth=1 https://github.com/bmax121/KernelPatch.git KernelPatch
 
       - name: Install aarch64 cross compiler
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq gcc-aarch64-linux-gnu
 
-      - name: Fix Makefile KP_ROOT
-        run: sed -i 's|KP_ROOT ?= .*|KP_ROOT ?= '"$HOME"'/KernelPatch|' Makefile
-
       - name: Build
+        env:
+          TARGET_COMPILE: aarch64-linux-gnu-
+          KP_DIR: ${{ github.workspace }}/KernelPatch
         run: make
 
       - name: Verify output
