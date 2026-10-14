@@ -1,0 +1,16 @@
+docs/FULL_FLOW.md
+  h_b87c1da9391a77 1-116
+hero_reader.c
+  h_b87c1da9391a77 22-23,345-354,357,361-363,365-371,373-376,378-383,385-391,393-400,403-406,409-410,412,415-418,420-421,424,691-692,697,1578
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "602b347d4ad13dd14d952fbbe6d08d1012d04cb1",
+  "prompts": {},
+  "humans": {
+    "h_b87c1da9391a77": {
+      "author": "CM6558 <c30080002@users.noreply.github.com>"
+    }
+  }
+}
