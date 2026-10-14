@@ -1,116 +1,141 @@
-# 内核态读取英雄坐标 — 完整流程 (2026-10-14 更新)
+# 完整流程文档 (2026-10-14 更新)
 
 ## 架构: 纯内核态, 零用户态, 零 /proc, 零 SELinux 依赖
+
+### 主路径: 纯指针链 (libGameCore.so .bss → 坐标)
 
 ```
 KPM 加载 (内核态)
   │
-  ▼ 1. hook access_process_vm
+  ▼ ① hook access_process_vm
   │   hook_fargs5 拦截所有 access_process_vm 调用
-  │   检查 arg0(task_struct) 的 comm 字段
-  │   匹配 "sgame"/"tmgp" → 记录 g_target_pid
+  │   读 arg0(task_struct)->comm, 匹配 "sgame"/"tmgp"
+  │   → g_target_pid = 游戏PID
   │
-  ▼ 2. reader_thread (kthread, 每 500ms 循环)
+  ▼ ② reader_thread (kthread, 每 500ms 循环)
   │
-  │   2a. 锁定 mm: get_task_mm(g_target_pid) → g_target_mm
-  │       使用 override_creds 切换 cred 绕过 SELinux
+  │   ②a. 锁定 mm: get_task_mm(g_target_pid) → g_target_mm
   │
-  │   2b. 定位基址: try_find_base_elf()  ← 新方案
-  │       vma_walk 遍历目标 mm 的所有 VMA
-  │       对每个可读 VMA (R, 非 RX) 读首 4 字节
-  │       匹配 \x7fELF magic → 候选 base = vm_start
-  │       读 base + 0xE344EA0 (s_domain 位置):
-  │         → 合法 MTE-tagged 堆指针 (>4GB) → 确认 base ✓
-  │         → 0 或垃圾 → 不是 base, 继续 ✗
-  │       二次验证: s_domain + 0x18 (assemblies begin) 也是合法指针
-  │       ★ 完全不碰 /proc, 不需要文件名, 不需要 vm_file/dentry 偏移
-  │       ★ IDA 确认: libil2cpp.so LOAD[0] p_vaddr=0, 所以 base = vm_start
+  │   ②b. 定位 libGameCore.so base: try_find_gc_base()
+  │        vma_walk 遍历 mm->mmap 链表
+  │        对每个 R(非RX) 的 VMA 读前4字节
+  │        匹配 \x7fELF → 候选 gc_base = vm_start
+  │        验证: 读 gc_base + 0x53ddb90 → NULL 或合法堆指针 (manager)
+  │        二次验证: manager+0x220 也是合法指针 (UnitLabelFinder)
+  │        通过 → g_gc_base = vm_start
   │
-  │   2c. 自动发现 UnitLabel 数组: scan_actor_arrays_vma()
-  │       vma_walk 遍历匿名 rw VMA
-  │       逐 1MB 读内存, 以 UNIT_LABEL_SIZE(184) 步长扫描
-  │       特征匹配:
-  │         +0x0C camp_id ∈ {1, 2}    (阵营ID)
-  │         +0x14 x_pos              (X坐标, 合理范围)
-  │         +0x1C z_pos              (Z坐标, 合理范围)
-  │         +0x2C hp ≥ 1             (生命值)
-  │       命中 → g_actor_begin / g_actor_end
+  │   ②c. 纯指针链读取坐标: read_hero_positions_chain()
+  │        gc_base + 0x53ddb90  → GameTacticsManager*   (.bss 全局, capstone 确认)
+  │        manager + 0x220       → UnitLabelFinder        (IDA 确认)
+  │        ulf + 0xC8           → UnitLabel 数组 begin    (IDA 确认)
+  │        ulf + 0xD0           → UnitLabel 数组 end       (IDA 确认)
+  │        验证: (end - begin) % 184 == 0                  (IDA 确认步长)
+  │        遍历数组:
+  │          UnitLabel[i] + 0x0C → camp_id                  (IDA 确认)
+  │          UnitLabel[i] + 0x14 → x_pos                    (IDA 确认)
+  │          UnitLabel[i] + 0x1C → z_pos                    (IDA 确认)
+  │          UnitLabel[i] + 0x2C → hp                       (IDA 确认)
+  │        → pr_info → dmesg
   │
-  │   2d. 读取坐标: read_hero_positions()
-  │       for i: label = begin + i*184
-  │         rm(&camp, label + 0x0C, 4)  → camp_id
-  │         rm(&x, label + 0x14, 4)     → x_pos
-  │         rm(&z, label + 0x1C, 4)     → z_pos
-  │         rm(&hp, label + 0x2C, 4)   → hp
-  │       → pr_info 输出到 dmesg
-  │
-  ▼ 用户态只需: dmesg | grep hero-reader
-    (ctl0 手动设置: /data/adb/ksud kpm control hero-reader "set <pid> <base>")
+  ▼ 用户态: dmesg | grep hero-reader
+    手动触发: ctl0 chain
 ```
 
-## 为什么去掉 /proc/pid/maps?
+### 关键发现: C++ 对象不在 IL2CPP static_fields 中
 
-| 问题 | 原因 |
+```
+旧路径 (已确认断裂):
+  libil2cpp_base + 0xE344EA0 → s_domain → assemblies → classes
+  → class + 0xB8 → static_fields + ??? → C++ 对象  ← ❌ 断裂!
+
+新路径 (capstone 确认):
+  libGameCore_base + 0x53ddb90 → GameTacticsManager*  ← ✅ .bss 全局指针
+
+根因:
+  libGameCore.so 不导入任何 il2cpp_* 函数 (672 个 PLT 导入全部检查)
+  C++ 对象由 libGameCore.so 内部 lazy-init 创建, 完全独立于 C# 层
+
+Evidence:
+  lazy-init @ vaddr 0x3167510:
+    adrp x19, #0x53dd000
+    ldr  x0, [x19, #0xb90]      ← x0 = *(0x53ddb90) = GameTacticsManager*
+    cbz  x0, init                 ← 未初始化则创建
+    ret                            ← 已初始化直接返回
+  init:
+    mov  w0, #0x38c0              ← malloc(14528 bytes)
+    bl   malloc
+    str  x0, [x19, #0xb90]       ← 存回 .bss 全局变量
+```
+
+## 完整指针链 (零扫描, 全确定性)
+
+| 步骤 | 偏移 | 含义 | 证据来源 |
+|------|------|------|---------|
+| ① hook | comm 匹配 | 捕获游戏 PID | hook access_process_vm |
+| ② 定位 base | ELF magic \x7fELF + manager 验证 | libGameCore.so base | VMA 遍历 (纯内核态) |
+| ③ | gc_base + 0x53ddb90 | GameTacticsManager* | capstone: lazy-init 0x3167510 |
+| ④ | manager + 0x220 | UnitLabelFinder 子对象 | IDA: Init 0x276a198: add x0, x24, #0x220 |
+| ⑤ | ulf + 0xC8 | UnitLabel 数组 begin | IDA: sub_24B2590: ldr [x21, #0xC8] |
+| ⑥ | ulf + 0xD0 | UnitLabel 数组 end | IDA: sub_24B2590: ldr [x21, #0xD0] |
+| ⑦ | (end-begin) % 184 | 验证数组步长 | IDA: add x23, x23, #0xB8 |
+| ⑧ | label + 0x0C | camp_id (阵营) | IDA: ldr w4, [x23, #0xC] ↔ camp:%d |
+| ⑨ | label + 0x14 | x_pos (X坐标) | IDA: ldr w8, [x23, #0x14] ↔ x:%d |
+| ⑩ | label + 0x1C | z_pos (Z坐标) | IDA: ldr w9, [x23, #0x1C] ↔ z:%d |
+| ⑪ | label + 0x2C | hp (生命值) | IDA: ldr w25, [x23, #0x2C] ↔ hp=%d |
+
+**全链路零扫描**: 每一步都有明确的偏移值和反编译证据, 不依赖任何盲扫或猜测。
+
+## ctl0 命令一览
+
+| 命令 | 作用 |
 |------|------|
-| kthread 读 /proc/pid/maps → -ENOENT | SELinux 域隔离: kthread 域 u:r:ksu 无权读 app 的 /proc |
-| override_creds 方案 | 依赖 cred 结构体偏移, 随内核版本变化 |
-| VMA 遍历找文件名 | 依赖 vm_file/dentry 偏移, __randomize_layout 打乱 |
-| **ELF magic 扫描** | **零偏移依赖**, 只需 vm_start/vm_end/vm_flags (固定偏移) |
+| `chain` | 手动触发纯指针链读取坐标 (主路径) |
+| `scan` | 手动触发堆特征扫描 (备用路径) |
+| `probe <类名>` | metadata 探测: 解析类型表+字段表, 打印指定类所有字段偏移 |
+| `findclass <类名>` | IL2CPP 类型系统: 遍历 VMA 找 class name 匹配 |
+| `walk` | IL2CPP 指针链遍历: domain→assemblies→images→classes |
+| `dump <地址> <字数>` | dump 指定地址的内存 (16字节/行) |
+| `peek <地址> [个数]` | peek 8字节值 |
+| `set <pid> <base>` | 手动设置 PID 和 libil2cpp.so base |
+| `read` | 手动读取一次坐标 (需先 actors 或 scan) |
+| `reset` | 重置所有状态 |
 
-### ELF magic 扫描的陷阱
+## 备用路径 (保留向后兼容)
 
-真机有两个映射都以 file_off=0 开始:
-1. 整文件只读映射 (217MB, R)
-2. LOAD[0] 段 (0x3A83A34 字节, R)
-
-两者都有 \x7fELF magic IDA 确认 LOAD[0] 的 p_vaddr=0, 所以 base = vm_start
-
-区分方法: 读 candidate + 0xE344EA0 (s_domain 位置):
-- 合法堆指针 (>4GB, MTE-tagged) → 正确 base ✓
-- 0 或非指针值 → 整文件映射或非 libil2cpp.so ✗
-
-## IDA 确认的偏移 (全部有反编译证据)
-
-### IL2CPP 结构体 (libil2cpp.so)
-| 偏移 | 含义 | 证据 |
-|------|------|------|
-| base + 0xE344EA0 | s_domain | sub_3ACE6DC return &qword_E344EB8 |
-| base + 0xE344EB8 | assemblies vector begin | sub_3ACE6DC |
-| s_domain + 0x18 | assemblies begin ptr | il2cpp_domain_get_assemblies |
-| image + 0x30 | class list ptr | il2cpp_class_from_name (0x3AE19D8) |
-| class + 0x10 | class name | il2cpp_class_get_name |
-| class + 0xB8 | static_fields | il2cpp_class_get_static_field_data |
-
-### UnitLabel 坐标布局 (libGameCore.so sub_24B2590)
-| 偏移 | 含义 | 证据 |
-|------|------|------|
-| +0x0C | camp_id (阵营) | ldr w4, [x23, #0xc] ↔ 格式串 camp:%d |
-| +0x14 | x_pos (X坐标) | ldr w8, [x23, #0x14] ↔ 格式串 x:%d |
-| +0x1C | z_pos (Z坐标) | ldr w9, [x23, #0x1c] ↔ 格式串 z:%d |
-| +0x2C | hp (生命值) | ldr w?, [x23, #0x2c] ↔ 格式串 hp=%d |
-| 0xB8 | 结构体大小=184 | 遍历步长 add x23, x23, #0xb8 |
-
-### VMA 结构体 (真机探针, Android 16 / 6.6.150)
-| 偏移 | 含义 |
-|------|------|
-| +0x00 | vm_start |
-| +0x08 | vm_end |
-| +0x10 | vm_mm |
-| +0x20 | vm_flags |
+如果主路径 (libGameCore.so 指针链) 失败:
+1. `try_find_base_elf()` 定位 libil2cpp.so base (ELF magic + s_domain 验证)
+2. `scan_actor_arrays()` 堆特征扫描 (184步长 + camp/hp/x/z 判据)
+3. `probe ActorManager` metadata 探测 (运行时内存中已解密的 metadata)
 
 ## 反检测特性
 
-| TP 检测手段 | 本方案是否可见 | 原因 |
+| TP 检测手段 | 是否可见 | 原因 |
 |------------|:---:|------|
 | /proc 扫描 | ✗ | 不碰 /proc |
 | ptrace 检测 | ✗ | 不调用 ptrace |
 | fd 扫描 | ✗ | 不打开任何文件 |
 | SELinux 审计 | ✗ | 不触发任何 avc 日志 |
 | 进程 comm 扫描 | ✗ | kthread 名 "hero-reader" |
-| access_process_vm hook | ✗ | hook 本身不修改返回值, 只读 arg0 |
+| access_process_vm hook | ✗ | hook 只读 arg0 不修改返回值 |
+| 用户态痕迹 | ✗ | 全程内核态 (EL1), 用户态零操作 |
 
-## 剩余待验证项
+## 诊断工具
 
-1. **堆特征扫描假阳性** — 真机上 Java/Dalvik 区可能巧合匹配, 需验证
-2. **static_fields → C++ 对象偏移** — IDA 确认 C++ 对象+0x220=UnitLabelFinder, 但 IL2CPP 类的 static_fields 内部哪个偏移持有 C++ 对象指针需真机 dump
-3. **VMA 偏移** — vm_start/vm_end/vm_flags 在目标设备内核版本上需验证
+### probe 命令 (metadata 探测)
+
+从 `g_base + 0xE340010` (s_metadata 指针) 读取运行时内存中已解密的 metadata:
+1. 验证 magic (0xFAB11BAF) + version (29)
+2. 解析类型定义表 → 匹配目标类名
+3. 解析字段定义表 → 打印所有字段 name + offset
+4. 诊断: 打印前 10 个 typedef 类名 (验证结构体大小是否正确)
+
+注意: 磁盘上的 global-metadata.dat 部分加密 (类型表类名是乱码),
+但运行时内存中的版本由 il2cpp_init() 解密, probe 读的是内存版本。
+
+## 待真机验证项
+
+1. libGameCore.so 的 .bss 偏移 0x53ddb90 (capstone 静态分析, 需真机确认)
+2. manager+0x220 在真机上是否是 UnitLabelFinder (IDA 确认的 Init 函数偏移)
+3. ELF magic VMA 扫描在真机上是否正确定位 libGameCore.so (2候选验证)
+4. manager 在游戏未进入对局时为 NULL (lazy-init 未触发), 进入对局后才有值
+5. probe 命令的 TYPEDEF_SIZE=108 在真机上是否正确 (诊断前10个类名验证)
