@@ -40,6 +40,28 @@
 #include <linux/kernel.h>
 #include <linux/string.h>
 #include <linux/sched.h>
+#include <linux/mm.h>
+
+/* ARM64 tagged pointer 去标记: 清除 bit48-63 (实测游戏指针 0xb400 在高位) */
+#define PTR_MASK               0x0000FFFFFFFFFFFFUL
+static inline unsigned long untag(unsigned long p)
+{
+    return p & PTR_MASK;
+}
+
+/* vm_flags 常量 (Linux 内核定义, 这里本地定义避免依赖头文件顺序) */
+#ifndef VM_READ
+#define VM_READ 0x00000001UL
+#endif
+#ifndef VM_WRITE
+#define VM_WRITE 0x00000002UL
+#endif
+#ifndef VM_EXEC
+#define VM_EXEC 0x00000004UL
+#endif
+#ifndef VM_SHARED
+#define VM_SHARED 0x00000008UL
+#endif
 
 KPM_NAME("hero-reader");
 KPM_VERSION("4.0.0");
@@ -272,6 +294,7 @@ struct hero_info {
     int index;
     int camp;
     int x, y, z;
+    int hp;
 };
 
 static struct {
@@ -425,6 +448,13 @@ static int maps_scan(const char *buf, int total, int at_file_start,
     (void)buf; (void)total; (void)at_file_start; (void)base_out; (void)line_off;
     return 0;                             /* 不再使用 /proc maps 路径 */
 }
+
+/* 前向声明: VMA 遍历函数定义在后面 */
+struct scan_ctx { unsigned long hits; };
+static int vma_walk(int (*cb)(void *, unsigned long, unsigned long, unsigned long),
+                    void *udata);
+static int elf_base_cb(void *udata, unsigned long start, unsigned long end,
+                      unsigned long flags);
 
 /* ELF magic VMA 扫描回调: 匹配 \x7fELF + s_domain 验证 */
 static int elf_base_cb(void *udata, unsigned long start, unsigned long end,
@@ -901,11 +931,6 @@ static int maps_line_is_heap_rw(const char *buf, int line_off, int line_end,
 }
 
 /* 前向声明 (VMA 遍历与扫描回调定义在后面) */
-struct scan_ctx {
-    unsigned long hits;
-};
-static int vma_walk(int (*cb)(void *, unsigned long, unsigned long, unsigned long),
-                    void *udata);
 static int scan_cb(void *udata, unsigned long start, unsigned long end,
                    unsigned long flags);
 
@@ -1126,12 +1151,6 @@ static void do_peek(unsigned long addr, int count)
 #define OFF_CLASS_NAME         0x10UL
 #define OFF_CLASS_NAMESPACE    0x18UL
 #define OFF_CLASS_STATICFIELDS 0xb8UL
-#define PTR_MASK               0x0000FFFFFFFFFFFFUL   /* 去高位标记 (bit48-63) */
-
-static unsigned long untag(unsigned long p)
-{
-    return p & PTR_MASK;
-}
 
 /* 读目标进程一个 u64 指针并去标记; 失败返回 0 */
 static unsigned long rptr(unsigned long addr)
