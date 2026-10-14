@@ -50,26 +50,68 @@ KPM_DESCRIPTION("Kernel-side IL2CPP actor reader (kpm-dev-kit compliant)");
  * 游戏侧偏移 (IDA 反编译确认; 与内核版本无关, 属于游戏数据布局)
  * ============================================================ */
 
-#define S_DOMAIN_ADDR            0xE340030UL
-#define ACTOR_SIZE                 1008
-#define ACTOR_CAMP_ID             0x08
-#define ACTOR_POS_X               0x20
-#define ACTOR_POS_Z               0x24
-#define ACTOR_POS_Y               0x28
+#define S_DOMAIN_ADDR            0xE344EA0UL   /* IDA: sub_3ACE6DC → &qword_E344EB8 = s_domain+0x18 */
+
+/*
+ * === IDA 反编译确认的数据布局 (2026-10-14) ===
+ *
+ * 坐标不在 Actor(1008) 数组中, 而在 UnitLabel(184) 数组中。
+ * 真机扫描旧常量 (1008/+0x08/+0x20/+0x24/+0x28) 产生垃圾值的根因。
+ *
+ * 证据链:
+ *   1. sub_24B2590 (UnitLabelFinder::GetPosFromMonster) @ libGameCore.so
+ *      格式串: "frame=%d type=%d hp=%d camp:%d m_camp:%d config:%d runtime:%d max_hp:%d x:%d z:%d x+z:%d"
+ *      遍历步长 0xB8 (184 字节), 从 UnitLabel 元素中直接读取 camp/hp/x/z 坐标
+ *   2. 0x3ac8a68 (TargetFinder) @ libGameCore.so
+ *      格式串: "hero_id:%d self_pos x:%d y:%d z:%d"
+ *      actor+0x0C 是 hero_id (不是旧的 +0x08)
+ *   3. 0x3ac8934: madd x10, x10, w11(=0x3F0), x26 → Actor 元素步长仍然 1008
+ *      但 Actor+0x18 是 entity_id (不是坐标), 用于关联 UnitLabel
+ */
+
+/* UnitLabel 结构体 (IDA 反编译确认, 步长 0xB8 = 184 字节)
+ * 来源: sub_24B2590 @ 0x24b2790: add x23, x23, #0xb8
+ * 数组遍历入口: x21+0xC8 = begin, x21+0xD0 = end */
+#define UNIT_LABEL_SIZE     0xB8               /* 184 字节, IDA: 0x24b2790 */
+#define LABEL_TYPE_ID       0x00               /* u32, 格式串 type=%d,  IDA: ldr w29, [x23] */
+#define LABEL_RUNTIME       0x04               /* u32, 格式串 runtime=%d, IDA: ldr w10, [x23, #4] */
+#define LABEL_CAMP_ID       0x0C               /* u32, 格式串 camp:%d,  IDA: ldr w4, [x23, #0xc] */
+#define LABEL_POS_X         0x14               /* u32, 格式串 x:%d,    IDA: ldr w8, [x23, #0x14] */
+#define LABEL_POS_Z         0x1C               /* u32, 格式串 z:%d,    IDA: ldr w9, [x23, #0x1c] */
+#define LABEL_HP            0x2C               /* u32, 格式串 hp=%d,   IDA: ldr w25, [x23, #0x2c] */
+#define LABEL_MAX_HP        0x34               /* u32, 格式串 max_hp:%d, IDA: ldr w12, [x23, #0x34] */
+
+/* Actor 结构体 (步长 0x3F0 = 1008 字节, 不含坐标!)
+ * 来源: 0x3ac8934: madd x10, w11(=0x3F0), x26
+ * Actor+0x18 = entity_id (用于关联 UnitLabel) */
+#define ACTOR_SIZE          0x3F0              /* 1008 字节 */
+#define ACTOR_ENTITY_ID     0x18               /* u32, IDA: ldr w10, [x10, #0x18] */
+
+/* IL2CPP 结构体偏移 (IDA 反编译确认, 与真机验证 100% 吻合) */
+#define DOMAIN_ASSEMBLIES_PTR  0x18             /* IDA: sub_3ACE6DC → &qword_E344EB8 */
+#define DOMAIN_ASSEMBLY_COUNT  0x20             /* IDA: il2cpp_domain_get_assemblies */
+#define ASSEMBLY_IMAGE         0x00             /* IDA: sub_3ACE740: return *(QWORD*)a1 */
+#define IMAGE_NAME             0x00             /* IDA: sub_3AE17EC: return *(QWORD*)a1 */
+#define IMAGE_CLASS_COUNT      0x18             /* IDA: sub_3AE1ED4: return *(uint*)(a1+24) */
+#define CLASS_NAME             0x10             /* IDA: sub_3AD153C: return *(QWORD*)(a1+16) */
+#define CLASS_NAMESPACE        0x18             /* IDA: sub_3AD1544: return *(QWORD*)(a1+24) */
+#define CLASS_STATIC_FIELDS    0xB8             /* IDA: il2cpp_class_get_static_field_data: return *(QWORD*)(a1+184) */
+
 #define MAX_HEROES                 10
 #define MAX_ACTORS                100
 
-/* ---- 内核态 Actor 自动发现 (堆特征扫描) ----
- * 特征: 连续若干块, 每块 ACTOR_SIZE=1008 字节, 偏移 0x08 处是 camp_id ∈ {1,2}。
+/* ---- 内核态 UnitLabel 自动发现 (堆特征扫描) ----
+ * 特征: 连续若干块, 每块 UNIT_LABEL_SIZE=184 字节, 偏移 0x0C 处是 camp_id ∈ {1,2},
+ * 偏移 0x2C 处是 hp >= 1。
  * 只扫描匿名可读写区 (堆), 内核读 /proc/<pid>/maps 收集候选区间后逐页扫描。 */
 #define SCAN_CHUNK         (1u << 20)          /* 每次 access_remote_vm 读 1MB */
-#define SCAN_BLOCK_MIN     8                   /* 连续命中块数下限 (5v5 至少 10 个 actor) */
+#define SCAN_BLOCK_MIN     8                   /* 连续命中块数下限 (5v5 至少 10 个单位) */
 #define SCAN_BLOCK_MAX     512                 /* 连续命中块数上限 */
 #define SCAN_MIN_HITS      6                   /* 整个区至少这么多命中块才算 */
 #define SCAN_MAX_REGION    (512u << 20)        /* 单区扫描上限 512MB */
 #define SCAN_MAX_PASSES    4000                /* 单次自动发现最多扫多少个候选区 (勿设小: 会漏区) */
-#define SCAN_BUF_SIZE      (SCAN_CHUNK + ACTOR_SIZE)   /* 跨块保留 ACTOR_SIZE 尾部 */
-#define SCAN_OVERLAP       ACTOR_SIZE          /* 块按 1008 步进跨分块边界 */
+#define SCAN_BUF_SIZE      (SCAN_CHUNK + UNIT_LABEL_SIZE)  /* 跨块保留尾部 */
+#define SCAN_OVERLAP       UNIT_LABEL_SIZE     /* 块按 184 步进跨分块边界 */
 #define SCAN_LOW_ADDR_MIN  0x100000000UL       /* 低于 4GB 的区视为 Java/JIT 空间, 跳过 */
 
 /* ============================================================
@@ -497,7 +539,7 @@ static void try_read_maps_base(void)
  * g_actor_begin/end。用户态不需要提供任何地址。
  *
  * 块特征: 偏移 0x08 是 camp_id ∈ {1,2} 且偏移 0x20 是合法小坐标,
- * 连续 SCAN_BLOCK_MIN..MAX 块按 ACTOR_SIZE=1008 步进成立 → 认定数组。
+ * 连续 SCAN_BLOCK_MIN..MAX 块按 UNIT_LABEL_SIZE=184 步进成立 → 认定数组。
  * ============================================================ */
 
 static char g_scan_buf[SCAN_BUF_SIZE];
@@ -535,17 +577,17 @@ static int scan_block_at(const char *buf, int window, unsigned long boff)
     const char *p;
     int camp, x, z, y;
 
-    if ((long)(boff + ACTOR_SIZE) > window)
+    if ((long)(boff + UNIT_LABEL_SIZE) > window)
         return 0;
     p = buf + boff;
-    camp = ld32(p + ACTOR_CAMP_ID);
+    camp = ld32(p + LABEL_CAMP_ID);
     if (camp != 1 && camp != 2)
         return 0;
     if (g_relaxed)
         return camp;
-    x = ld32(p + ACTOR_POS_X);
-    z = ld32(p + ACTOR_POS_Z);
-    y = ld32(p + ACTOR_POS_Y);
+    x = ld32(p + LABEL_POS_X);
+    z = ld32(p + LABEL_POS_Z);
+    y = ld32(p + LABEL_HP);  /* IDA: y 不在 UnitLabel, 改读 hp 做有效性验证 */
     if (!coord_ok(x) || !coord_ok(z) || !coord_ok(y))
         return 0;
     return camp;
@@ -555,7 +597,7 @@ static int scan_block_at(const char *buf, int window, unsigned long boff)
  *
  * 数组起点可能落在区内任意偏移 (不一定与区起点 1008 对齐), 因此算法是:
  *   1) 逐字节找 camp 候选 (int32 ∈ {1,2}) → 候选数组起点 = camp偏移 - 0x08;
- *   2) 从候选起点按 ACTOR_SIZE 步进验证连续块, 连续 >= SCAN_BLOCK_MIN 即认定。
+ *   2) 从候选起点按 UNIT_LABEL_SIZE 步进验证连续块, 连续 >= SCAN_BLOCK_MIN 即认定。
  *
  * 缓冲纪律 (关键): 只把"新读到的字节"追加到缓冲尾, 从不重读同一段 ——
  * 否则重复内容会在缓冲里伪造出 1008 周期的假链。因此 off 只按实际读到的
@@ -572,11 +614,11 @@ static int scan_region(unsigned long start, unsigned long end,
     unsigned long region_end = start + total;
     int carry = 0;
     const int need = SCAN_BLOCK_MIN;
-    const int keep = (SCAN_BLOCK_MIN + 1) * ACTOR_SIZE;   /* 跨读取边界保留量 */
+    const int keep = (SCAN_BLOCK_MIN + 1) * UNIT_LABEL_SIZE;   /* 跨读取边界保留量 */
 
     if (total > SCAN_MAX_REGION)
         region_end = start + SCAN_MAX_REGION;
-    if (total < (unsigned long)need * ACTOR_SIZE)
+    if (total < (unsigned long)need * UNIT_LABEL_SIZE)
         return 0;
 
     while (off < region_end) {
@@ -618,7 +660,7 @@ static int scan_region(unsigned long start, unsigned long end,
                     else
                         camp2 = 1;
                     run++;
-                    a += ACTOR_SIZE;
+                    a += UNIT_LABEL_SIZE;
                     if (run >= need)
                         break;
                 }
@@ -628,7 +670,7 @@ static int scan_region(unsigned long start, unsigned long end,
 
                     while (scan_block_at(g_scan_buf, carry, b)) {
                         full++;
-                        b += ACTOR_SIZE;
+                        b += UNIT_LABEL_SIZE;
                     }
                     *out_begin = base_off + boff;
                     *out_blocks = full;
@@ -819,7 +861,7 @@ static int scan_actor_arrays(int verbose)
                     if (g_scan_passes < SCAN_MAX_PASSES &&
                         scan_region(s, e, &ab, &blocks)) {
                         g_actor_begin = ab;
-                        g_actor_end = ab + (unsigned long)blocks * ACTOR_SIZE;
+                        g_actor_end = ab + (unsigned long)blocks * UNIT_LABEL_SIZE;
                         g_scan_found++;
                         pr_info("[hero-reader] 自动发现 Actor 数组: 0x%lx-0x%lx (%d 块, 区 0x%lx-0x%lx)\n",
                                 g_actor_begin, g_actor_end, blocks, s, e);
@@ -932,7 +974,7 @@ static int scan_cb(void *udata, unsigned long start, unsigned long end,
                 start, end, (end - start) >> 20);
     if (scan_region(start, end, &ab, &blocks)) {
         g_actor_begin = ab;
-        g_actor_end = ab + (unsigned long)blocks * ACTOR_SIZE;
+        g_actor_end = ab + (unsigned long)blocks * UNIT_LABEL_SIZE;
         g_scan_found++;
         ctx->hits++;
         pr_info("[hero-reader] 自动发现 Actor 数组: 0x%lx-0x%lx (%d 块, 区 0x%lx-0x%lx)\n",
@@ -954,23 +996,23 @@ static void read_hero_positions(void)
 
     if (!g_actor_begin || g_actor_end <= g_actor_begin)
         return;
-    total = (g_actor_end - g_actor_begin) / ACTOR_SIZE;
+    total = (g_actor_end - g_actor_begin) / UNIT_LABEL_SIZE;
     if (!total || total > MAX_ACTORS)
         return;
 
     for (i = 0; i < (int)total && count < MAX_HEROES; i++) {
-        unsigned long actor = g_actor_begin + (unsigned long)i * ACTOR_SIZE;
+        unsigned long actor = g_actor_begin + (unsigned long)i * UNIT_LABEL_SIZE;
         int camp, x, z, y;
 
-        if (!rm(&camp, actor + ACTOR_CAMP_ID, 4))
+        if (!rm(&camp, actor + LABEL_CAMP_ID, 4))
             continue;
         if (camp != 1 && camp != 2)
             continue;
-        if (!rm(&x, actor + ACTOR_POS_X, 4))
+        if (!rm(&x, actor + LABEL_POS_X, 4))
             continue;
-        if (!rm(&z, actor + ACTOR_POS_Z, 4))
+        if (!rm(&z, actor + LABEL_POS_Z, 4))
             continue;
-        if (!rm(&y, actor + ACTOR_POS_Y, 4))
+        if (!rm(&y, actor + LABEL_HP, 4))  /* IDA: y 不在 UnitLabel, 改读 hp */
             continue;
         if (x == 0 && z == 0)
             continue;
@@ -1403,7 +1445,7 @@ static void do_dump(unsigned long addr, int words)
     int i;
 
     if (words <= 0)
-        words = ACTOR_SIZE / 4;          /* 默认整块 */
+        words = UNIT_LABEL_SIZE / 4;     /* 默认整块 */
     if (words > 512)
         words = 512;
     pr_info("[hero-reader] dump 0x%lx x%d words:\n", addr, words);
@@ -1463,7 +1505,7 @@ static int find_cb(void *udata, unsigned long start, unsigned long end,
             a = (unsigned long)(c - 8);
             while (scan_block_at(g_scan_buf, carry + n, a)) {
                 run++;
-                a += ACTOR_SIZE;
+                a += UNIT_LABEL_SIZE;
                 if (run >= SCAN_BLOCK_MIN)
                     break;
             }
@@ -1480,7 +1522,7 @@ static int find_cb(void *udata, unsigned long start, unsigned long end,
                         "0x08=%08x 0x18=%08x 0x20=%08x 0x24=%08x 0x28=%08x\n",
                         g_find_count, base, start, end, run, v08, v18, v20, v24, v28);
                 g_find_count++;
-                c += ACTOR_SIZE - 1;
+                c += UNIT_LABEL_SIZE - 1;
             }
         }
         {
