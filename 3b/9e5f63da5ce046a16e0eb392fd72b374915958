@@ -1,0 +1,14 @@
+hero_reader.c
+  h_b87c1da9391a77 53-99,103-105,108,113-114,542,580,583,588-590,600,617,621,663,673,864,977,999,1004,1007,1011,1013,1015,1448,1508,1525
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3b9e5f63da5ce046a16e0eb392fd72b374915958",
+  "prompts": {},
+  "humans": {
+    "h_b87c1da9391a77": {
+      "author": "CM6558 <c30080002@users.noreply.github.com>"
+    }
+  }
+}
