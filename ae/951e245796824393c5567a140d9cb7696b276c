@@ -1,0 +1,16 @@
+docs/CAPSTONE_ANALYSIS.md
+  h_b87c1da9391a77 1-187
+hero_reader.c
+  h_b87c1da9391a77 102-111,226,248,492-665,1830,1974-1986,2028-2036,2333-2335
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ae951e245796824393c5567a140d9cb7696b276c",
+  "prompts": {},
+  "humans": {
+    "h_b87c1da9391a77": {
+      "author": "CM6558 <c30080002@users.noreply.github.com>"
+    }
+  }
+}
