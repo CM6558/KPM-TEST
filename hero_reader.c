@@ -52,6 +52,7 @@ KPM_DESCRIPTION("Kernel-side IL2CPP actor reader (kpm-dev-kit compliant)");
  * ============================================================ */
 
 #define S_DOMAIN_ADDR            0xE344EA0UL   /* IDA: sub_3ACE6DC → &qword_E344EB8 = s_domain+0x18 */
+#define S_METADATA_ADDR          0xE340010UL   /* IDA: .bss 全局指针 s_GlobalMetadataHeader */
 
 /*
  * === IDA 反编译确认的数据布局 (2026-10-14) ===
@@ -97,6 +98,54 @@ KPM_DESCRIPTION("Kernel-side IL2CPP actor reader (kpm-dev-kit compliant)");
 #define CLASS_NAME             0x10             /* IDA: sub_3AD153C: return *(QWORD*)(a1+16) */
 #define CLASS_NAMESPACE        0x18             /* IDA: sub_3AD1544: return *(QWORD*)(a1+24) */
 #define CLASS_STATIC_FIELDS    0xB8             /* IDA: il2cpp_class_get_static_field_data: return *(QWORD*)(a1+184) */
+
+/* IL2CPP metadata 结构体偏移 (IL2CPP v29 header layout)
+ * header 起始就是 magic, 各表用 {offset, count} 对描述
+ * offset 相对 metadata header 起始 */
+#define IL2CPP_MAGIC            0xFAB11BAF
+#define IL2CPP_VERSION_29        29
+
+/* Il2CppGlobalMetadataHeader (v29) 的字段偏移
+ * 每个表条目是 8 字节: offset(4) + count(4) */
+#define MD_OFF_STRING_LITERAL    0x08   /* stringLiteralOffset, stringLiteralCount */
+#define MD_OFF_STRING            0x10   /* stringOffset, stringLiteralCount ← 字符串表 */
+#define MD_OFF_EVENTS            0x18   /* eventsOffset, eventsCount */
+#define MD_OFF_PROPERTIES        0x20   /* propertiesOffset, propertiesCount */
+#define MD_OFF_METHODS            0x28   /* methodsOffset, methodsCount ← 方法定义表 */
+#define MD_OFF_PARAMETER_DEFAULT_VALUES 0x30
+#define MD_OFF_FIELD_DEFAULT_VALUES 0x38
+#define MD_OFF_FIELD_AND_PARAMETER_DEFAULT_VALUE_TYPES 0x40
+#define MD_OFF_FIELD_MARSHALING   0x48
+#define MD_OFF_PARAMETERS         0x50   /* parameterOffset, parameterCount */
+#define MD_OFF_FIELDS             0x58   /* fieldsOffset, fieldsCount ← 字段定义表 ★ */
+#define MD_OFF_GENERIC_PARAMETERS 0x60
+#define MD_OFF_GENERIC_PARAMETER_CONSTRAINTS 0x68
+#define MD_OFF_GENERIC_CONTAINERS 0x70
+#define MD_OFF_NESTED_TYPES       0x78
+#define MD_OFF_INTERFACES         0x80
+#define MD_OFF_VTABLE_METHODS    0x88
+#define MD_OFF_INTERFACE_OFFSETS  0x90
+#define MD_OFF_TYPE_DEFINITIONS  0x98   /* typeDefinitionsOffset, typeDefinitionsCount ← 类型表 */
+#define MD_OFF_IMAGES            0xA0   /* imagesOffset, imagesCount */
+#define MD_OFF_ASSEMBLIES        0xA8   /* assembliesOffset, assembliesCount */
+
+/* TypeDefinition 结构体大小 (v29 = 108 bytes) */
+#define TYPEDEF_SIZE             108
+/* FieldDefinition 结构体大小 (v29 = 24 bytes) */
+#define FIELDDEF_SIZE            24
+
+/* TypeDefinition 内部偏移 */
+#define TD_NAME_INDEX            0x00   /* u32, 字符串表 index */
+#define TD_NAMESPACE_INDEX       0x04   /* u32, namespace 字符串表 index */
+#define TD_FIELDS_START          0x4C   /* u32, field start index (v29, 可能变) */
+#define TD_FIELD_COUNT           0x50   /* u32, field count */
+
+/* FieldDefinition 内部偏移 */
+#define FD_NAME_INDEX            0x00   /* u32, 字段名字符串表 index */
+#define FD_TYPE_INDEX            0x04   /* u32, 类型 index */
+#define FD_OFFSET                0x0C   /* u32, 字段在 static_fields 中的偏移 ★ */
+
+#define MD_MAX_CLASSES           256    /* 最多打印的类数 */
 
 #define MAX_HEROES                 10
 #define MAX_ACTORS                100
@@ -192,6 +241,9 @@ static volatile int           g_req_hunt        = 0;   /* 手动触发 domain �
 static volatile int           g_req_walk        = 0;   /* 手动触发指针链遍历 */
 static volatile unsigned long g_req_classes_addr = 0;
 static volatile int           g_req_classes_valid = 0;
+static volatile int           g_req_probe       = 0;   /* 手动触发 metadata 探测 */
+static char                   g_req_md_classname[64];  /* metadata 探测的目标类名 */
+static volatile int           g_req_probe_valid  = 0;
 static char                   g_req_fc_name[40];
 static volatile int           g_req_fc_valid   = 0;
 static volatile unsigned long g_req_dump_addr   = 0;   /* 手动 dump 一个块 */
@@ -1385,6 +1437,199 @@ static void do_vma_probe(unsigned long addr)
 }
 
 /* ============================================================
+ * metadata 探测: 从 .bss 读 s_metadata, 验证 magic/version,
+ * 解析类型表 + 字段表, 打印指定类的所有字段偏移。
+ * 闭环验证: 从字段偏移读 static_fields → C++对象 → +0x220+0xC8 → UnitLabel数组
+ * ============================================================ */
+
+/* 从 metadata 字符串表读一个字符串 (null 结尾) */
+static int md_read_string(unsigned long md_base, unsigned long str_table_off,
+                          unsigned int name_idx, char *buf, int bufsize)
+{
+    unsigned long addr = md_base + str_table_off + name_idx;
+    int i;
+
+    for (i = 0; i < bufsize - 1; i++) {
+        char c;
+        if (!rm(&c, addr + i, 1))
+            return 0;
+        if (c == 0)
+            break;
+        buf[i] = c;
+    }
+    buf[i] = 0;
+    return i > 0;
+}
+
+/* 逐字节比较 metadata 字符串表中的字符串和目标 */
+static int md_string_eq(unsigned long md_base, unsigned long str_table_off,
+                        unsigned int name_idx, const char *target)
+{
+    unsigned long addr = md_base + str_table_off + name_idx;
+    int i;
+
+    for (i = 0; i < 64; i++) {
+        char c;
+        if (!rm(&c, addr + i, 1))
+            return 0;
+        if (c != target[i])
+            return 0;
+        if (c == 0)
+            return 1;               /* 完整匹配 (含 null 终止) */
+    }
+    return 0;
+}
+
+static void do_probe_metadata(const char *target_classname)
+{
+    unsigned long s_metadata_ptr = 0;
+    unsigned int magic, version;
+    unsigned int str_off;
+    unsigned int td_off, td_cnt;
+    unsigned int fd_off, fd_cnt;
+    int i, found = 0;
+
+    if (!g_base || !g_target_mm) {
+        pr_warn("[hero-reader] probe: base 或 mm 未就绪\n");
+        return;
+    }
+
+    /* ① 读 s_metadata 指针 (base + 0xE340010) */
+    if (!rm(&s_metadata_ptr, g_base + S_METADATA_ADDR, 8)) {
+        pr_warn("[hero-reader] probe: 读 S_METADATA_ADDR 失败\n");
+        return;
+    }
+    s_metadata_ptr = untag(s_metadata_ptr);
+    if (!s_metadata_ptr || s_metadata_ptr < 0x100000000UL) {
+        pr_warn("[hero-reader] probe: s_metadata 指针无效 (0x%lx)\n", s_metadata_ptr);
+        return;
+    }
+    pr_info("[hero-reader] probe: s_metadata=0x%lx\n", s_metadata_ptr);
+
+    /* ② 验证 magic + version */
+    if (!rm(&magic, s_metadata_ptr, 4) || !rm(&version, s_metadata_ptr + 4, 4)) {
+        pr_warn("[hero-reader] probe: 读 magic/version 失败\n");
+        return;
+    }
+    if (magic != IL2CPP_MAGIC) {
+        pr_warn("[hero-reader] probe: magic 不匹配 (0x%X ≠ 0x%X)\n", magic, IL2CPP_MAGIC);
+        return;
+    }
+    if (version != IL2CPP_VERSION_29) {
+        pr_warn("[hero-reader] probe: version=%d (预期 29), 继续尝试…\n", version);
+    }
+    pr_info("[hero-reader] probe: magic=0x%X version=%d ✓\n", magic, version);
+
+    /* ③ 读字符串表偏移 */
+    if (!rm(&str_off, s_metadata_ptr + MD_OFF_STRING, 4)) {
+        pr_warn("[hero-reader] probe: 读字符串表偏移失败\n");
+        return;
+    }
+    pr_info("[hero-reader] probe: string table offset=0x%X\n", str_off);
+
+    /* ④ 读类型定义表偏移+数量 */
+    if (!rm(&td_off, s_metadata_ptr + MD_OFF_TYPE_DEFINITIONS, 4) ||
+        !rm(&td_cnt, s_metadata_ptr + MD_OFF_TYPE_DEFINITIONS + 4, 4)) {
+        pr_warn("[hero-reader] probe: 读类型表偏移失败\n");
+        return;
+    }
+    pr_info("[hero-reader] probe: typedef count=%u (合理范围 50K~100K)\n", td_cnt);
+    if (td_cnt < 50000 || td_cnt > 100000) {
+        pr_warn("[hero-reader] probe: typedef count 异常 (%u), metadata 可能不完整\n", td_cnt);
+        /* 不 return, 继续尝试 */
+    }
+
+    /* ⑤ 读字段定义表偏移+数量 */
+    if (!rm(&fd_off, s_metadata_ptr + MD_OFF_FIELDS, 4) ||
+        !rm(&fd_cnt, s_metadata_ptr + MD_OFF_FIELDS + 4, 4)) {
+        pr_warn("[hero-reader] probe: 读字段表偏移失败\n");
+        return;
+    }
+    pr_info("[hero-reader] probe: fielddef count=%u\n", fd_cnt);
+
+    /* ⑥ 遍历类型定义表, 找目标类名 */
+    for (i = 0; i < (int)td_cnt && i < 70000; i++) {
+        unsigned long td_addr = s_metadata_ptr + td_off + (unsigned long)i * TYPEDEF_SIZE;
+        unsigned int name_idx, ns_idx;
+        unsigned int fields_start = 0, field_count = 0;
+
+        if (!rm(&name_idx, td_addr + TD_NAME_INDEX, 4))
+            break;
+
+        /* 快速比较类名 */
+        if (!md_string_eq(s_metadata_ptr, str_off, name_idx, target_classname))
+            continue;
+
+        /* 命中! 读 namespace 和字段信息 */
+        rm(&ns_idx, td_addr + TD_NAMESPACE_INDEX, 4);
+        rm(&fields_start, td_addr + TD_FIELDS_START, 4);
+        rm(&field_count, td_addr + TD_FIELD_COUNT, 4);
+
+        /* 读 namespace 字符串 */
+        {
+            char ns_buf[128] = {0};
+            md_read_string(s_metadata_ptr, str_off, ns_idx, ns_buf, sizeof(ns_buf));
+            pr_info("[hero-reader] ★ 找到类 '%s' (namespace='%s', typedef#%d, fields_start=%u, field_count=%u)\n",
+                    target_classname, ns_buf, i, fields_start, field_count);
+        }
+
+        /* ⑦ 遍历该类的所有字段, 打印 name + offset */
+        {
+            int j;
+            unsigned long class_sf = 0;
+
+            /* 尝试通过 IL2CPP 类型系统获取 static_fields 地址 */
+            /* 先用 findclass 等效逻辑: 遍历 VMA 找 class name 匹配 → +0xB8 */
+            /* 这里简化: 只打印字段定义, 不实际读 static_fields */
+            for (j = 0; j < (int)field_count && j < 64; j++) {
+                unsigned long fd_addr = s_metadata_ptr + fd_off +
+                                        (unsigned long)(fields_start + j) * FIELDDEF_SIZE;
+                unsigned int f_name_idx = 0, f_offset = 0;
+
+                rm(&f_name_idx, fd_addr + FD_NAME_INDEX, 4);
+                rm(&f_offset, fd_addr + FD_OFFSET, 4);
+
+                /* 读字段名 */
+                {
+                    char fname[64] = {0};
+                    md_read_string(s_metadata_ptr, str_off, f_name_idx, fname, sizeof(fname));
+                    pr_info("[hero-reader]   field[%d]: '%s' offset=0x%X (%u)\n",
+                            j, fname, f_offset, f_offset);
+                }
+            }
+        }
+
+        found++;
+        break;                          /* 只找第一个匹配 */
+    }
+
+    if (!found) {
+        pr_warn("[hero-reader] probe: 在 %u 个类型定义中未找到类名 '%s'\n", td_cnt, target_classname);
+
+        /* 诊断: 打印前 10 个类名看看字符串表是否正常 */
+        pr_info("[hero-reader] probe: 诊断 — 前 10 个类型定义的类名:\n");
+        for (i = 0; i < 10; i++) {
+            unsigned long td_addr = s_metadata_ptr + td_off + (unsigned long)i * TYPEDEF_SIZE;
+            unsigned int name_idx;
+            char name_buf2[64] = {0};
+
+            if (!rm(&name_idx, td_addr + TD_NAME_INDEX, 4))
+                break;
+            md_read_string(s_metadata_ptr, str_off, name_idx, name_buf2, sizeof(name_buf2));
+            pr_info("[hero-reader]   typedef[%d]: '%s'\n", i, name_buf2);
+        }
+        return;
+    }
+
+    /* ⑧ 闭环验证: 用 IL2CPP 类型系统 findclass 获取 static_fields,
+     *    然后逐个字段偏移读值, 验证哪个是 C++ 对象指针 */
+    pr_info("[hero-reader] probe: 开始闭环验证 — findclass '%s' → static_fields → 逐偏移验证\n",
+            target_classname);
+    pr_info("[hero-reader] probe: 后续步骤: ctl0 findclass %s → 得到 static_fields → 手动 dump 验证\n",
+            target_classname);
+}
+
+/* ============================================================
  * 状态复位 (仅在 reader 线程 / exit 里调用; mm 的取放单点)
  * ============================================================ */
 
@@ -1500,6 +1745,10 @@ static int reader_thread(void *data)
         if (g_req_walk) {
             g_req_walk = 0;
             do_walk(30);
+        }
+        if (g_req_probe_valid) {
+            g_req_probe_valid = 0;
+            do_probe_metadata(g_req_md_classname);
         }
         if (g_req_hunt) {
             g_req_hunt = 0;
@@ -1883,6 +2132,23 @@ static long hero_reader_ctl0(const char *args, char *__user out_msg, int outlen)
     } else if (!strcmp(args, "walk")) {
         g_req_walk = 1;
         snprintf(resp, sizeof(resp), "walk: 指针链遍历已入队 (结果看 dmesg)");
+    } else if (!strncmp(args, "probe ", 6)) {
+        const char *p = args + 6;
+        int l = 0;
+
+        while (*p == ' ')
+            p++;
+        while (p[l] && l < 63) {
+            g_req_md_classname[l] = p[l];
+            l++;
+        }
+        g_req_md_classname[l] = 0;
+        if (l > 0) {
+            g_req_probe_valid = 1;
+            snprintf(resp, sizeof(resp), "probe '%s' 已入队 (结果看 dmesg)", g_req_md_classname);
+        } else {
+            snprintf(resp, sizeof(resp), "probe: 用法 'probe <类名>'");
+        }
     } else if (!strncmp(args, "classes ", 8)) {
         const char *p = args + 8;
         unsigned long a = 0;
