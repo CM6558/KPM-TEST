@@ -99,6 +99,16 @@ KPM_DESCRIPTION("Kernel-side IL2CPP actor reader (kpm-dev-kit compliant)");
 #define CLASS_NAMESPACE        0x18             /* IDA: sub_3AD1544: return *(QWORD*)(a1+24) */
 #define CLASS_STATIC_FIELDS    0xB8             /* IDA: il2cpp_class_get_static_field_data: return *(QWORD*)(a1+184) */
 
+/* libGameCore.so 偏移 (capstone 静态分析确认)
+ * C++ GameTacticsManager 对象存储在 libGameCore.so 的 .bss 全局变量中,
+ * 完全独立于 IL2CPP C# 类型系统 (libGameCore.so 不导入任何 il2cpp_* 函数)
+ * Evidence: lazy-init @ vaddr 0x3167510: adrp x19,#0x53dd000; ldr x0,[x19,#0xb90] */
+#define GC_MANAGER_BSS_OFF     0x53ddb90UL      /* .bss: GameTacticsManager* 全局指针 */
+#define GC_MANAGER_OBJ_SIZE    0x38C0           /* lazy-init: malloc(0x38c0) = 14528 字节 */
+#define GC_OBJ_UNIT_LABEL_FINDER 0x220           /* IDA: x24+0x220 = UnitLabelFinder 子对象 */
+#define GC_ULF_ARRAY_BEGIN      0xC8             /* IDA: x21+0xC8 = UnitLabel 数组 begin */
+#define GC_ULF_ARRAY_END        0xD0            /* IDA: x21+0xD0 = UnitLabel 数组 end */
+
 /* IL2CPP metadata 结构体偏移 (IL2CPP v29 header layout)
  * header 起始就是 magic, 各表用 {offset, count} 对描述
  * offset 相对 metadata header 起始 */
@@ -213,6 +223,7 @@ static pid_t          g_target_pid   = 0;      /* 当前目标进程 */
 static void          *g_target_mm    = NULL;   /* 目标 mm (持有一个 mm_users 引用) */
 static pid_t          g_mm_pid       = 0;      /* g_target_mm 属于哪个 pid */
 static unsigned long  g_base         = 0;      /* libil2cpp.so 基址 */
+static unsigned long  g_gc_base      = 0;      /* libGameCore.so 基址 */
 static unsigned long  g_sdomain      = 0;      /* 最近一次读到的 s_domain 指针 */
 static unsigned long  g_actor_begin  = 0;      /* Actor 数组范围 (手动或扫描) */
 static unsigned long  g_actor_end    = 0;
@@ -234,6 +245,7 @@ static volatile int           g_req_peek_count  = 0;
 static volatile int           g_req_peek_valid  = 0;
 static volatile int           g_req_read        = 0;   /* 手动触发一次读取 */
 static volatile int           g_req_scan        = 0;   /* 手动触发一次 Actor 自动发现 */
+static volatile int           g_req_chain       = 0;   /* 手动触发纯指针链读取 */
 static volatile unsigned long g_req_vma_addr    = 0;   /* 手动触发一次 VMA 探测 */
 static volatile int           g_req_vma_valid   = 0;
 static volatile int           g_req_find        = 0;   /* 手动触发放宽判据候选搜索 */
@@ -475,6 +487,180 @@ static void try_find_base_elf(void)
     } else if (g_maps_tries % 4 == 0) {
         pr_warn("[hero-reader] ELF magic 扫描未命中 (%d VMA, 游戏未加载?)\n", n);
     }
+}
+
+/* libGameCore.so base 定位: ELF magic + .bss manager 指针验证
+ * 验证方法: candidate + GC_MANAGER_BSS_OFF (0x53ddb90) 应是 NULL 或合法堆指针
+ * (lazy-init: 未初始化=NULL, 已初始化=堆指针) */
+static int gc_base_cb(void *udata, unsigned long start, unsigned long end,
+                      unsigned long flags)
+{
+    unsigned long *out = udata;
+    unsigned char magic[4];
+    unsigned long mgr;
+
+    (void)end;
+    if (!(flags & VM_READ) || (flags & VM_EXEC))
+        return 0;
+
+    if (!rm(magic, start, 4))
+        return 0;
+    if (magic[0] != 0x7f || magic[1] != 'E' ||
+        magic[2] != 'L' || magic[3] != 'F')
+        return 0;
+
+    /* 验证: start + 0x53ddb90 应是 NULL(未初始化) 或合法堆指针(已初始化) */
+    if (!rm(&mgr, start + GC_MANAGER_BSS_OFF, 8))
+        return 0;
+    mgr = untag(mgr);
+    if (mgr && mgr < 0x100000000UL)
+        return 0;                     /* 非零但不合法 → 不是 libGameCore.so */
+
+    /* 二次验证: 如果 mgr 非零(已初始化), mgr+0x220 应也是合法指针 */
+    if (mgr) {
+        unsigned long ulf;
+        if (!rm(&ulf, mgr + GC_OBJ_UNIT_LABEL_FINDER, 8))
+            return 0;
+        ulf = untag(ulf);
+        if (!ulf || ulf < 0x100000000UL)
+            return 0;
+    }
+
+    *out = start;
+    pr_info("[hero-reader] libGameCore.so ELF magic 命中: gc_base=0x%lx manager=0x%lx\n",
+            start, mgr);
+    return 1;
+}
+
+static void try_find_gc_base(void)
+{
+    unsigned long base = 0;
+    int n;
+
+    if (!g_target_mm || !p_find_vma || !p_access_remote_vm)
+        return;
+    if (g_gc_base)
+        return;                         /* 已找到, 不重复 */
+    if (g_maps_tries % 10 != 5)        /* 错开 libil2cpp 的扫描 (offset 5) */
+        return;
+
+    n = vma_walk(gc_base_cb, &base);
+    if (base) {
+        g_gc_base = base;
+        pr_info("[hero-reader] libGameCore.so base=0x%lx (ELF magic VMA, %d VMA)\n",
+                base, n);
+    }
+}
+
+/* ============================================================
+ * 纯指针链读取英雄坐标 (零扫描, 全确定性)
+ *
+ * 完整指针链 (IDA + capstone 确认):
+ *   libGameCore_base + 0x53ddb90 → GameTacticsManager*  (.bss 全局)
+ *   manager + 0x220               → UnitLabelFinder 子对象
+ *   UnitLabelFinder + 0xC8        → UnitLabel 数组 begin
+ *   UnitLabelFinder + 0xD0        → UnitLabel 数组 end
+ *   UnitLabel[i] + 0x0C/0x14/0x1C/0x2C → camp/x/z/hp
+ *   步长 0xB8 (184 字节)
+ *
+ * libGameCore.so 不导入任何 il2cpp_* 函数, C++ 对象完全独立于 C# 层。
+ * ============================================================ */
+static int read_hero_positions_chain(void)
+{
+    unsigned long manager, ulf, begin, end;
+    int i, count = 0;
+
+    if (!g_gc_base) {
+        pr_warn("[hero-reader] chain: gc_base 未就绪\n");
+        return 0;
+    }
+
+    /* ① 读 GameTacticsManager 指针 */
+    if (!rm(&manager, g_gc_base + GC_MANAGER_BSS_OFF, 8)) {
+        pr_warn("[hero-reader] chain: 读 manager 指针失败\n");
+        return 0;
+    }
+    manager = untag(manager);
+    if (!manager || manager < 0x100000000UL) {
+        pr_warn("[hero-reader] chain: manager 指针无效 (0x%lx, 游戏未进入战斗?)\n", manager);
+        return 0;
+    }
+
+    /* ② 读 UnitLabelFinder 子对象 */
+    if (!rm(&ulf, manager + GC_OBJ_UNIT_LABEL_FINDER, 8)) {
+        pr_warn("[hero-reader] chain: 读 UnitLabelFinder 失败\n");
+        return 0;
+    }
+    ulf = untag(ulf);
+    if (!ulf || ulf < 0x100000000UL) {
+        pr_warn("[hero-reader] chain: UnitLabelFinder 无效 (0x%lx)\n", ulf);
+        return 0;
+    }
+
+    /* ③ 读 UnitLabel 数组 begin/end */
+    if (!rm(&begin, ulf + GC_ULF_ARRAY_BEGIN, 8) ||
+        !rm(&end, ulf + GC_ULF_ARRAY_END, 8)) {
+        pr_warn("[hero-reader] chain: 读数组 begin/end 失败\n");
+        return 0;
+    }
+    begin = untag(begin);
+    end = untag(end);
+    if (!begin || begin >= end) {
+        pr_warn("[hero-reader] chain: 数组区间无效 (begin=0x%lx end=0x%lx)\n", begin, end);
+        return 0;
+    }
+
+    /* 验证: (end - begin) 应是 184 的倍数 */
+    {
+        unsigned long total = end - begin;
+        if (total % UNIT_LABEL_SIZE != 0) {
+            pr_warn("[hero-reader] chain: 数组大小 %lu 不是 %d 的倍数\n",
+                    total, UNIT_LABEL_SIZE);
+            return 0;
+        }
+        count = (int)(total / UNIT_LABEL_SIZE);
+    }
+
+    pr_info("[hero-reader] ★ 指针链命中: manager=0x%lx ulf=0x%lx array=0x%lx-0x%lx (%d 单位)\n",
+            manager, ulf, begin, end, count);
+
+    /* ④ 遍历 UnitLabel 数组, 读坐标 */
+    for (i = 0; i < count && i < MAX_ACTORS; i++) {
+        unsigned long p = begin + (unsigned long)i * UNIT_LABEL_SIZE;
+        unsigned int camp, x, z, hp;
+
+        if (!rm(&camp, p + LABEL_CAMP_ID, 4))
+            break;
+        if (!rm(&hp, p + LABEL_HP, 4))
+            break;
+        if (hp < 1)
+            continue;                 /* 无效单位 */
+
+        rm(&x, p + LABEL_POS_X, 4);
+        rm(&z, p + LABEL_POS_Z, 4);
+
+        pr_info("[hero-reader]   [%d] camp=%d x=%d z=%d hp=%d\n",
+                i, camp, x, z, hp);
+
+        if (i < MAX_HEROES) {
+            g_snapshot.heroes[i].index = i;
+            g_snapshot.heroes[i].camp = (int)camp;
+            g_snapshot.heroes[i].x = (int)x;
+            g_snapshot.heroes[i].z = (int)z;
+            g_snapshot.heroes[i].hp = (int)hp;
+        }
+    }
+
+    g_snapshot.count = (i < MAX_HEROES) ? i : MAX_HEROES;
+    g_snapshot.valid = 1;
+
+    /* 写入 g_actor_begin/end 供旧代码兼容 */
+    g_actor_begin = begin;
+    g_actor_end = end;
+
+    pr_info("[hero-reader] ★ 读取完成: %d 个有效单位\n",
+            g_snapshot.count);
+    return 1;
 }
 
 /* ============================================================
@@ -1641,6 +1827,7 @@ static void reset_target_state(const char *why)
     }
     g_mm_pid = 0;
     g_base = 0;
+    g_gc_base = 0;
     g_sdomain = 0;
     g_actor_begin = 0;
     g_actor_end = 0;
@@ -1784,6 +1971,19 @@ static int reader_thread(void *data)
                 pr_warn("[hero-reader] 手动 scan 失败: 目标 mm 未锁定\n");
             }
         }
+        if (g_req_chain) {
+            g_req_chain = 0;
+            if (g_target_mm) {
+                if (!g_gc_base)
+                    try_find_gc_base();
+                if (g_gc_base)
+                    read_hero_positions_chain();
+                else
+                    pr_warn("[hero-reader] chain 失败: gc_base 未就绪 (libGameCore.so 未加载?)\n");
+            } else {
+                pr_warn("[hero-reader] chain 失败: 目标 mm 未锁定\n");
+            }
+        }
         if (g_req_read) {
             g_req_read = 0;
             if (g_target_mm && g_base) {
@@ -1825,7 +2025,15 @@ static int reader_thread(void *data)
             if (g_target_mm) {
                 if (!g_base)
                     try_find_base_elf();
-                if (g_base) {
+                if (!g_gc_base)
+                    try_find_gc_base();
+
+                /* 主路径: 纯指针链 (libGameCore.so → manager → +0x220 → +0xC8) */
+                if (g_gc_base) {
+                    read_hero_positions_chain();
+
+                /* 备用路径: libil2cpp base + 扫描 (保留向后兼容) */
+                } else if (g_base) {
                     unsigned long sd = 0;
 
                     if (rm(&sd, g_base + S_DOMAIN_ADDR, 8)) {
@@ -1837,7 +2045,6 @@ static int reader_thread(void *data)
                         if (g_actor_begin && g_actor_end) {
                             read_hero_positions();
                         } else if (!g_scan_done) {
-                            /* base 就绪 → 内核态自动发现 Actor 数组 (只做一次) */
                             g_scan_done = 1;
                             pr_info("[hero-reader] base 就绪, 开始内核态 Actor 自动发现 (扫描 %lu 个候选区)…\n",
                                     g_scan_passes);
@@ -2123,6 +2330,9 @@ static long hero_reader_ctl0(const char *args, char *__user out_msg, int outlen)
     } else if (!strcmp(args, "scan")) {
         g_req_scan = 1;
         snprintf(resp, sizeof(resp), "scan: 内核态自动发现已入队 (结果看 dmesg)");
+    } else if (!strcmp(args, "chain")) {
+        g_req_chain = 1;
+        snprintf(resp, sizeof(resp), "chain: 纯指针链读取已入队 (结果看 dmesg)");
     } else if (!strcmp(args, "find")) {
         g_req_find = 1;
         snprintf(resp, sizeof(resp), "find: 放宽判据候选搜索已入队 (结果看 dmesg)");
