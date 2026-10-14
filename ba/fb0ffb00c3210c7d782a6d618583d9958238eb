@@ -1,0 +1,14 @@
+docs/FULL_FLOW.md
+  h_b87c1da9391a77 1,5-6,10,12-13,15,17,19-25,27-38,40-41,44,46-90,92-108,112,119-133,135,137-141
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "bafb0ffb00c3210c7d782a6d618583d9958238eb",
+  "prompts": {},
+  "humans": {
+    "h_b87c1da9391a77": {
+      "author": "CM6558 <c30080002@users.noreply.github.com>"
+    }
+  }
+}
