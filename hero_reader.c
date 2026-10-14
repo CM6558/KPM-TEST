@@ -101,6 +101,16 @@ static void *(*p_filp_open)(const char *path, int flags, int mode);
 static long  (*p_kernel_read)(void *file, void *buf, unsigned long count, long long *pos);
 static int   (*p_filp_close)(void *file, void *id);
 
+/* cred 切换 — 以目标进程身份读它自己的 /proc/<pid>/maps
+ * 根因 (真机实测): kthread 的 SELinux 域是 u:r:ksu:s0, 读 app 的 maps 会触发
+ * hidepid/ptrace_may_access 检查并被故意返回 -ENOENT ("假装目录不存在")。
+ * 解法: override_creds() 临时换成目标进程的 cred (get_task_cred), 使检查变成
+ * "app 读自己的 /proc" → 全部放行; 读完 revert_creds() 恢复。全程内核态, 不碰用户态。 */
+static void *(*p_override_creds)(void *new_cred);
+static void  (*p_revert_creds)(void *old_cred);
+static void *(*p_get_task_cred)(void *tsk);
+static void  (*p_put_cred)(void *cred);
+
 /* ============================================================
  * 全局状态
  * 单消费者模型: 状态迁移 (pid/base/actors 生效、mm 取放) 全部在 reader 线程里做;
@@ -359,6 +369,61 @@ static int maps_scan(const char *buf, int total, int at_file_start,
     return 0;
 }
 
+/* 以目标进程身份打开文件 — override_creds 切到目标 cred, 使 hidepid/ptrace/
+ * SELinux 检查按"app 读自己"放行 (kthread 域 u:r:ksu 直接 open 会 -ENOENT)。
+ * 返回文件指针 (可 IS_ERR); ctx 记录 cred 上下文, 必须配对 filp_close_as_pid()。 */
+struct pid_cred_ctx {
+    void *cred;   /* get_task_cred 返回值 (需 put_cred) */
+    void *old;    /* override_creds 返回值 (需 revert_creds) */
+};
+
+static void *filp_open_as_pid(const char *path, int flags, int mode,
+                              pid_t pid, struct pid_cred_ctx *ctx)
+{
+    void *tsk = NULL, *f;
+
+    memset(ctx, 0, sizeof(*ctx));
+    if (!p_filp_open)
+        return NULL;
+    if (p_get_task_cred && p_override_creds && p_revert_creds &&
+        p_rcu_read_lock && p_rcu_read_unlock) {
+        p_rcu_read_lock();
+        tsk = p_find_task_by_vpid(pid);
+        if (tsk)
+            ctx->cred = p_get_task_cred(tsk);
+        p_rcu_read_unlock();
+        pr_info("[hero-reader] cred 诊断: pid=%d tsk=%lx cred=%lx\n",
+                pid, (unsigned long)tsk, (unsigned long)ctx->cred);
+        if (ctx->cred)
+            ctx->old = p_override_creds(ctx->cred);
+    } else {
+        pr_info("[hero-reader] cred 诊断: 符号缺失(override=%d revert=%d getcred=%d rcu=%d/%d), 直接 open\n",
+                p_override_creds ? 1 : 0, p_revert_creds ? 1 : 0,
+                p_get_task_cred ? 1 : 0,
+                p_rcu_read_lock ? 1 : 0, p_rcu_read_unlock ? 1 : 0);
+    }
+    f = p_filp_open(path, flags, mode);
+    pr_info("[hero-reader] cred 诊断: open %s → %lx (old=%lx)\n",
+            path, (unsigned long)f, (unsigned long)ctx->old);
+    return f;
+}
+
+/* 只恢复 cred 上下文 (文件打开失败提前退出时用; 此时 f 是 ERR 指针, 不能 filp_close) */
+static void pid_cred_restore(struct pid_cred_ctx *ctx)
+{
+    if (ctx->old && p_revert_creds)
+        p_revert_creds(ctx->old);
+    if (ctx->cred && p_put_cred)
+        p_put_cred(ctx->cred);
+}
+
+static void filp_close_as_pid(void *f, struct pid_cred_ctx *ctx)
+{
+    if (f && p_filp_close)
+        p_filp_close(f, NULL);
+    pid_cred_restore(ctx);
+}
+
 /* 读一次 /proc/<pid>/maps 定位 libil2cpp.so 基址; ~5s 重试一次 */
 static void try_read_maps_base(void)
 {
@@ -370,6 +435,7 @@ static void try_read_maps_base(void)
     unsigned long base = 0, read_total = 0;
     int line_off = 0;
     int n;
+    struct pid_cred_ctx ctx;
 
     if (!g_target_pid || !p_filp_open || !p_kernel_read || !p_filp_close)
         return;                          /* 符号缺失: 只能靠 ctl0 set 提供 base */
@@ -377,8 +443,10 @@ static void try_read_maps_base(void)
         return;                          /* 500ms * 10 = ~5s 重试间隔 */
 
     snprintf(path, sizeof(path), "/proc/%d/maps", (int)g_target_pid);
-    f = p_filp_open(path, 0 /* O_RDONLY */, 0);
+    /* 以目标进程身份打开 — kthread 域 (u:r:ksu) 直接 open 会被 hidepid 判 -ENOENT */
+    f = filp_open_as_pid(path, 0 /* O_RDONLY */, 0, g_target_pid, &ctx);
     if (!f || (unsigned long)f >= (unsigned long)-4095UL) {   /* IS_ERR */
+        pid_cred_restore(&ctx);          /* 提前退出也要恢复 cred */
         if (g_maps_tries % 4 == 0)
             pr_warn("[hero-reader] 打开 %s 失败 (%lx); 可用 ctl0 'set <pid> <base>' 手动提供\n",
                     path, (unsigned long)f);
@@ -409,7 +477,7 @@ static void try_read_maps_base(void)
             carry = total;
         }
     }
-    p_filp_close(f, NULL);
+    filp_close_as_pid(f, &ctx);
 
     if (found && base) {
         g_base = base;
@@ -697,6 +765,7 @@ static int scan_actor_arrays(int verbose)
     int n, found = 0;
     int lines = 0, heap_lines = 0, reads = 0;
     unsigned long fval = 0;
+    struct pid_cred_ctx ctx;
 
     if (!g_target_mm || !p_access_remote_vm)
         return 0;
@@ -704,11 +773,12 @@ static int scan_actor_arrays(int verbose)
         return 0;
 
     snprintf(path, sizeof(path), "/proc/%d/maps", (int)g_target_pid);
-    f = p_filp_open(path, 0, 0);
+    /* 以目标进程身份打开 — 否则 kthread 域被 hidepid 拦 (-ENOENT) */
+    f = filp_open_as_pid(path, 0, 0, g_target_pid, &ctx);
     fval = (unsigned long)f;
     if (!f || fval >= (unsigned long)-4095UL) {
-        /* 内核线程读 app 的 /proc/maps 常被 SELinux 拦下 (实测 -ENOENT):
-         * 自动回退到纯内核 VMA 遍历 (不碰 /proc)。 */
+        /* 兜底: cred 切换失败或仍被拦时, 回退纯内核 VMA 遍历 */
+        pid_cred_restore(&ctx);
         pr_info("[hero-reader] scan: 打开 %s 失败 (rc=%lx) → 回退纯内核 VMA 遍历\n",
                 path, fval);
         return scan_actor_arrays_vma(verbose);
@@ -773,7 +843,7 @@ static int scan_actor_arrays(int verbose)
     }
 
 out:
-    p_filp_close(f, NULL);
+    filp_close_as_pid(f, &ctx);
     if (verbose)
         pr_info("[hero-reader] scan 诊断: 读 %lu 字节 (%d 次), 行=%d, 匿名rw=%d, 候选已扫=%lu\n",
                 read_total, reads, lines, heap_lines, g_scan_passes);
@@ -1762,12 +1832,22 @@ static long hero_reader_init(const char *args, const char *event, void *reserved
     KSYM_OPT(int (*)(void *, void *),              filp_close,           "filp_close");
     KSYM_OPT(void *(*)(void *, unsigned long),     find_vma,             "find_vma");
 
+    /* cred 切换族: 内核态以目标进程身份读 /proc/<pid>/maps (hidepid 绕过) */
+    KSYM_OPT(void *(*)(void *),                    override_creds,        "override_creds");
+    KSYM_OPT(void (*)(void *),                     revert_creds,          "revert_creds");
+    KSYM_OPT(void *(*)(void *),                    get_task_cred,         "get_task_cred");
+    KSYM_OPT(void (*)(void *),                     put_cred,              "put_cred");
+
     if (!p_rcu_read_lock || !p_rcu_read_unlock)
         pr_warn("[hero-reader] RCU 原语缺失: 目标锁定存在极小竞态窗口\n");
     if (!p_access_process_vm)
         pr_warn("[hero-reader] access_process_vm 缺失: 自动捕获不可用, 用 ctl0 'set'\n");
     if (!p_filp_open || !p_kernel_read || !p_filp_close)
         pr_warn("[hero-reader] 文件符号缺失: 自动基址(maps)不可用, 用 ctl0 'set'\n");
+    if (!p_override_creds || !p_revert_creds || !p_get_task_cred || !p_put_cred)
+        pr_warn("[hero-reader] cred 符号缺失 (%d/%d/%d/%d): maps 读取可能仍被 hidepid 拦, 回退 VMA 遍历\n",
+                p_override_creds ? 1 : 0, p_revert_creds ? 1 : 0,
+                p_get_task_cred ? 1 : 0, p_put_cred ? 1 : 0);
 
     /* init args: "[pid] [0xbase]" 可选 */
     if (args && *args) {
