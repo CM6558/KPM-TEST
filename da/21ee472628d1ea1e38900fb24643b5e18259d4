@@ -1,0 +1,14 @@
+docs/METADATA_PROBE.md
+  h_b87c1da9391a77 1-103
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "da21ee472628d1ea1e38900fb24643b5e18259d4",
+  "prompts": {},
+  "humans": {
+    "h_b87c1da9391a77": {
+      "author": "CM6558 <c30080002@users.noreply.github.com>"
+    }
+  }
+}
