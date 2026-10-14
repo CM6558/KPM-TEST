@@ -441,12 +441,103 @@ static void capture_access_vm(hook_fargs5_t *args, void *udata)
  * 这个验证完全不依赖文件名 / vm_file / dentry 偏移。
  * ============================================================ */
 
-/* 在缓冲里找以 "libil2cpp.so" 结尾的行 (已废弃, 保留兼容旧 ctl0 路径) */
-static int maps_scan(const char *buf, int total, int at_file_start,
-                     unsigned long *base_out, int *line_off)
+/* 以目标进程身份打开文件 — override_creds 切到目标 cred, 使 hidepid/ptrace/
+ * SELinux 检查按"app 读自己"放行。返回文件指针 (可 IS_ERR)。 */
+struct pid_cred_ctx {
+    void *cred;   /* get_task_cred 返回值 (需 put_cred) */
+    void *old;    /* override_creds 返回值 (需 revert_creds) */
+};
+
+static void *filp_open_as_pid(const char *path, int flags, int mode,
+                              pid_t pid, struct pid_cred_ctx *ctx)
 {
-    (void)buf; (void)total; (void)at_file_start; (void)base_out; (void)line_off;
-    return 0;                             /* 不再使用 /proc maps 路径 */
+    void *tsk = NULL, *f;
+
+    memset(ctx, 0, sizeof(*ctx));
+    if (!p_filp_open)
+        return NULL;
+    if (p_get_task_cred && p_override_creds && p_revert_creds &&
+        p_rcu_read_lock && p_rcu_read_unlock) {
+        p_rcu_read_lock();
+        tsk = p_find_task_by_vpid(pid);
+        if (tsk)
+            ctx->cred = p_get_task_cred(tsk);
+        p_rcu_read_unlock();
+        if (ctx->cred)
+            ctx->old = p_override_creds(ctx->cred);
+    }
+    f = p_filp_open(path, flags, mode);
+    return f;
+}
+
+static void filp_close_as_pid(void *f, struct pid_cred_ctx *ctx)
+{
+    if (f && p_filp_close)
+        p_filp_close(f, NULL);
+    if (ctx->old && p_revert_creds)
+        p_revert_creds(ctx->old);
+    if (ctx->cred && p_put_cred)
+        p_put_cred(ctx->cred);
+}
+
+/* 从 /proc/<pid>/maps 解析指定库的基址 (轻量, 只读文件不遍历 VMA)
+ * libname 需匹配 maps 行末的文件路径 (如 "libil2cpp.so")
+ * 返回: 成功=基址, 失败=0 */
+static unsigned long find_lib_base_from_maps(pid_t pid, const char *libname)
+{
+    char path[64], buf[4096];
+    long pos, n, total = 0;
+    void *f;
+    struct pid_cred_ctx ctx;
+    unsigned long base = 0;
+
+    if (!p_filp_open || !p_kernel_read || !p_filp_close)
+        return 0;
+
+    snprintf(path, sizeof(path), "/proc/%d/maps", pid);
+    f = filp_open_as_pid(path, 0, 0, pid, &ctx);
+    if (!f)
+        return 0;
+
+    pos = 0;
+    while ((n = p_kernel_read(f, buf + total, sizeof(buf) - total - 1, &pos)) > 0) {
+        int i;
+
+        total += n;
+        buf[total] = 0;
+
+        /* 逐行解析 */
+        for (i = 0; i < total; i++) {
+            if (buf[i] != '\n')
+                continue;
+            buf[i] = 0;
+
+            /* 格式: start-end perms offset dev inode pathname */
+            if (sscanf(buf, "%lx-%lx %*s %*x %*x:%*x %*u %63s",
+                       &base, (unsigned long *)&buf[8]) != 2) {
+                buf[i] = '\n';
+                continue;
+            }
+
+            /* 检查文件名是否匹配 */
+            if (strstr(buf + i - 1, libname) != NULL) {
+                buf[i] = '\n';
+                filp_close_as_pid(f, &ctx);
+                pr_info("[hero-reader] maps 找到 %s: base=0x%lx\n", libname, base);
+                return base;
+            }
+            buf[i] = '\n';
+        }
+
+        /* 保留尾部未完整行供下次拼接 */
+        if (total > 2048) {
+            memmove(buf, buf + total - 2048, 2048);
+            total = 2048;
+        }
+    }
+
+    filp_close_as_pid(f, &ctx);
+    return 0;
 }
 
 /* 前向声明: VMA 遍历函数定义在后面 */
@@ -2041,14 +2132,17 @@ static int reader_thread(void *data)
                 reset_target_state("pid 变更, 重新锁定");
             }
 
-            if (g_target_mm) {
+                if (g_target_mm) {
                 if (!g_base)
                     try_find_base_elf();
-                if (!g_gc_base)
-                    try_find_gc_base();
+                /* 禁用自动 gc_base 扫描 (避免 VMA 遍历导致闪退) */
+                /* 仅在手动触发 'chain' 时才查找 libGameCore.so */
+                /* if (!g_gc_base)
+                    try_find_gc_base(); */
 
-                /* 主路径: 纯指针链 (libGameCore.so → manager → +0x220 → +0xC8) */
-                if (g_gc_base) {
+                /* 主路径：纯指针链 (libGameCore.so → manager → +0x220 → +0xC8) */
+                if (g_req_chain && g_gc_base) {
+                    g_req_chain = 0;
                     read_hero_positions_chain();
 
                 /* 备用路径: libil2cpp base + 扫描 (保留向后兼容) */
