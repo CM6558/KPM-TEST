@@ -19,7 +19,8 @@
  *     之后所有跨进程内存读走 access_remote_vm(mm, ...); 释放走 mmput()。
  *  4. 结构体偏移: 任务字段用 KP 导出的 task_struct_offset (核心启动时实测填充);
  *     不再碰 vm_area_struct/file/dentry 这些未导出、且随内核版本变化的偏移。
- *     基址定位改为读 /proc/<pid>/maps (标准机制), 失败时用 ctl0 手动提供。
+ *     基址定位改为 ELF magic VMA 扫描 (纯内核态, 零 /proc, 零 SELinux): 遍历目标 mm 的
+     *     VMA, 匹配 \x7fELF + base+0xE344EA0 处 s_domain 指针验证 (不依赖文件名/dentry 偏移)。
  *  5. SukiSU 上 ctl0 没有字符串回传通道 (ksud 只回 int, 负数按 errno 打印):
  *     结果一律 pr_info 进 dmesg; compat_copy_to_user 只在 out_msg 非空时调用
  *     (兼容 APatch 原生路径)。
@@ -341,193 +342,86 @@ static void capture_access_vm(hook_fargs5_t *args, void *udata)
 }
 
 /* ============================================================
- * 基址定位: 内核读 /proc/<pid>/maps (标准机制, 零结构体偏移)
- * 只在自动捕获流程里兜底; 用户态控制命令 (ctl0 set) 提供的 base 优先。
+ * 基址定位: ELF magic VMA 扫描 (纯内核态, 零 /proc, 零 SELinux)
+ *
+ * 原理: libil2cpp.so 的 ELF header 以 \x7fELF 开头。遍历目标进程
+ * VMA 链表, 对每个可读 VMA 读首 4 字节, 匹配 \x7fELF magic。
+ *
+ * 陷阱: 真机有两个映射都以 file_off=0 开始 (整文件只读映射 +
+ * LOAD[0] 段), 两者都有 \x7fELF magic。区分方法: 读
+ * candidate + S_DOMAIN_ADDR (0xE344EA0), 如果读出合法的
+ * MTE-tagged 堆指针 → 正确 base; 读到 0/垃圾 → 不是 base。
+ * 这个验证完全不依赖文件名 / vm_file / dentry 偏移。
  * ============================================================ */
 
-/* 在缓冲里找以 "libil2cpp.so" 结尾的行, 解析行首的起始地址。
- * at_file_start: buf[0] 是否就是文件开头 (决定行首截断是否可接受)。
- * 返回 1 = 找到; line_off 指向该行的行首。 */
+/* 在缓冲里找以 "libil2cpp.so" 结尾的行 (已废弃, 保留兼容旧 ctl0 路径) */
 static int maps_scan(const char *buf, int total, int at_file_start,
                      unsigned long *base_out, int *line_off)
 {
-    static const char needle[] = "libil2cpp.so";
-    const int nlen = 12;
-    int i;
+    (void)buf; (void)total; (void)at_file_start; (void)base_out; (void)line_off;
+    return 0;                             /* 不再使用 /proc maps 路径 */
+}
 
-    if (total <= nlen + 1)
+/* ELF magic VMA 扫描回调: 匹配 \x7fELF + s_domain 验证 */
+static int elf_base_cb(void *udata, unsigned long start, unsigned long end,
+                      unsigned long flags)
+{
+    unsigned long *out = udata;
+    unsigned char magic[4];
+    unsigned long sd;
+
+    (void)end;
+    /* 只看可读 VMA, 排除可执行 VMA (ELF header 在 R 段, 不在 RX 段) */
+    if (!(flags & VM_READ) || (flags & VM_EXEC))
         return 0;
 
-    for (i = 0; i + nlen + 1 <= total; i++) {
-        int k, j;
-        unsigned long v = 0;
-        int got = 0;
+    /* 读 VMA 前 4 字节, 匹配 \x7fELF */
+    if (!rm(magic, start, 4))
+        return 0;
+    if (magic[0] != 0x7f || magic[1] != 'E' ||
+        magic[2] != 'L' || magic[3] != 'F')
+        return 0;
 
-        for (k = 0; k < nlen; k++) {
-            if (buf[i + k] != needle[k])
-                break;
-        }
-        if (k != nlen)
-            continue;
-        /* 路径结尾必须是 ".so" 前面紧跟 '/', 且后面是行尾/空格(如 " (deleted)") */
-        if (i == 0 || buf[i - 1] != '/')
-            continue;
-        {
-            /* 行尾检查: LF(10) / CR(13) / 空格(32, 容忍 " (deleted)" 后缀) */
-            int tail = (unsigned char)buf[i + nlen];
+    /* 候选 base = start (LOAD[0] p_vaddr=0, base = vm_start) */
+    /* 验证: base + 0xE344EA0 应是合法堆指针 (s_domain) */
+    if (!rm(&sd, start + S_DOMAIN_ADDR, 8))
+        return 0;
+    sd = untag(sd);
+    if (!sd || sd < 0x100000000UL)
+        return 0;
 
-            if (tail != 10 && tail != 13 && tail != 32)
-                continue;
-        }
-        /* 回退到行首 */
-        j = i;
-        while (j > 0 && buf[j - 1] != '\n')
-            j--;
-        if (j == 0 && !at_file_start)
-            continue;                    /* 行首落在上一块里 — 等重叠区再找 */
-        /* 解析行首 "start-end" 的 start (十六进制直到 '-') */
-        {
-            int p = j;
-            while (p < i && buf[p] != '-') {
-                char c = buf[p];
-                int d;
-
-                if (c >= '0' && c <= '9')       d = c - '0';
-                else if (c >= 'a' && c <= 'f')  d = c - 'a' + 10;
-                else if (c >= 'A' && c <= 'F')  d = c - 'A' + 10;
-                else break;
-                v = v * 16 + (unsigned long)d;
-                got = 1;
-                p++;
-            }
-        }
-        if (!got || !v)
-            continue;
-        *base_out = v;
-        if (line_off)
-            *line_off = j;
-        return 1;
+    /* 二次验证: sd + 0x18 (assemblies begin) 也是合法指针 */
+    {
+        unsigned long asm_begin;
+        if (!rm(&asm_begin, sd + DOMAIN_ASSEMBLIES_PTR, 8))
+            return 0;
+        asm_begin = untag(asm_begin);
+        if (!asm_begin || asm_begin < 0x100000000UL)
+            return 0;
     }
-    return 0;
+
+    *out = start;
+    pr_info("[hero-reader] ELF magic VMA 命中: base=0x%lx s_domain=0x%lx\n",
+            start, sd);
+    return 1;
 }
 
-/* 以目标进程身份打开文件 — override_creds 切到目标 cred, 使 hidepid/ptrace/
- * SELinux 检查按"app 读自己"放行 (kthread 域 u:r:ksu 直接 open 会 -ENOENT)。
- * 返回文件指针 (可 IS_ERR); ctx 记录 cred 上下文, 必须配对 filp_close_as_pid()。 */
-struct pid_cred_ctx {
-    void *cred;   /* get_task_cred 返回值 (需 put_cred) */
-    void *old;    /* override_creds 返回值 (需 revert_creds) */
-};
-
-static void *filp_open_as_pid(const char *path, int flags, int mode,
-                              pid_t pid, struct pid_cred_ctx *ctx)
+/* 纯内核态 ELF magic + s_domain 验证定位 base */
+static void try_find_base_elf(void)
 {
-    void *tsk = NULL, *f;
-
-    memset(ctx, 0, sizeof(*ctx));
-    if (!p_filp_open)
-        return NULL;
-    if (p_get_task_cred && p_override_creds && p_revert_creds &&
-        p_rcu_read_lock && p_rcu_read_unlock) {
-        p_rcu_read_lock();
-        tsk = p_find_task_by_vpid(pid);
-        if (tsk)
-            ctx->cred = p_get_task_cred(tsk);
-        p_rcu_read_unlock();
-        pr_info("[hero-reader] cred 诊断: pid=%d tsk=%lx cred=%lx\n",
-                pid, (unsigned long)tsk, (unsigned long)ctx->cred);
-        if (ctx->cred)
-            ctx->old = p_override_creds(ctx->cred);
-    } else {
-        pr_info("[hero-reader] cred 诊断: 符号缺失(override=%d revert=%d getcred=%d rcu=%d/%d), 直接 open\n",
-                p_override_creds ? 1 : 0, p_revert_creds ? 1 : 0,
-                p_get_task_cred ? 1 : 0,
-                p_rcu_read_lock ? 1 : 0, p_rcu_read_unlock ? 1 : 0);
-    }
-    f = p_filp_open(path, flags, mode);
-    pr_info("[hero-reader] cred 诊断: open %s → %lx (old=%lx)\n",
-            path, (unsigned long)f, (unsigned long)ctx->old);
-    return f;
-}
-
-/* 只恢复 cred 上下文 (文件打开失败提前退出时用; 此时 f 是 ERR 指针, 不能 filp_close) */
-static void pid_cred_restore(struct pid_cred_ctx *ctx)
-{
-    if (ctx->old && p_revert_creds)
-        p_revert_creds(ctx->old);
-    if (ctx->cred && p_put_cred)
-        p_put_cred(ctx->cred);
-}
-
-static void filp_close_as_pid(void *f, struct pid_cred_ctx *ctx)
-{
-    if (f && p_filp_close)
-        p_filp_close(f, NULL);
-    pid_cred_restore(ctx);
-}
-
-/* 读一次 /proc/<pid>/maps 定位 libil2cpp.so 基址; ~5s 重试一次 */
-static void try_read_maps_base(void)
-{
-    void *f;
-    char path[32];
-    long long pos = 0;
-    int carry = 0, found = 0;
-    unsigned long buf_file_off = 0;      /* 缓冲首字节对应的文件偏移 */
-    unsigned long base = 0, read_total = 0;
-    int line_off = 0;
+    unsigned long base = 0;
     int n;
-    struct pid_cred_ctx ctx;
 
-    if (!g_target_pid || !p_filp_open || !p_kernel_read || !p_filp_close)
-        return;                          /* 符号缺失: 只能靠 ctl0 set 提供 base */
-    if (g_maps_tries++ % 10 != 0)
-        return;                          /* 500ms * 10 = ~5s 重试间隔 */
-
-    snprintf(path, sizeof(path), "/proc/%d/maps", (int)g_target_pid);
-    /* 以目标进程身份打开 — kthread 域 (u:r:ksu) 直接 open 会被 hidepid 判 -ENOENT */
-    f = filp_open_as_pid(path, 0 /* O_RDONLY */, 0, g_target_pid, &ctx);
-    if (!f || (unsigned long)f >= (unsigned long)-4095UL) {   /* IS_ERR */
-        pid_cred_restore(&ctx);          /* 提前退出也要恢复 cred */
-        if (g_maps_tries % 4 == 0)
-            pr_warn("[hero-reader] 打开 %s 失败 (%lx); 可用 ctl0 'set <pid> <base>' 手动提供\n",
-                    path, (unsigned long)f);
+    if (!g_target_mm || !p_find_vma || !p_access_remote_vm)
         return;
-    }
+    if (g_maps_tries++ % 10 != 0)        /* ~5s 重试间隔 */
+        return;
 
-    for (;;) {
-        int total;
-
-        n = (int)p_kernel_read(f, g_maps_buf + carry, MAPS_WINDOW, &pos);
-        if (n <= 0)
-            break;
-        read_total += (unsigned long)n;
-        total = carry + n;
-        /* at_start 判据 = 缓冲首字节是否就是文件第 0 字节 (短读时缓冲仍从 0 开始) */
-        if (maps_scan(g_maps_buf, total, buf_file_off == 0, &base, &line_off)) {
-            found = 1;
-            break;
-        }
-        if (read_total > MAPS_MAX_TOTAL)
-            break;
-        /* 保留尾部重叠, 保证跨块的行能被完整看到 */
-        if (total > MAPS_OVERLAP) {
-            memmove(g_maps_buf, g_maps_buf + total - MAPS_OVERLAP, MAPS_OVERLAP);
-            buf_file_off += (unsigned long)(total - MAPS_OVERLAP);
-            carry = MAPS_OVERLAP;
-        } else {
-            carry = total;
-        }
-    }
-    filp_close_as_pid(f, &ctx);
-
-    if (found && base) {
+    n = vma_walk(elf_base_cb, &base);
+    if (base) {
         g_base = base;
-        pr_info("[hero-reader] libil2cpp.so base=0x%lx (maps) line=%.80s\n",
-                base, g_maps_buf + line_off);
     } else if (g_maps_tries % 4 == 0) {
-        pr_warn("[hero-reader] maps 未找到 libil2cpp.so (第 %d 次; 游戏未加载? 或 ctl0 'set <pid> <base>')\n",
-                g_maps_tries);
+        pr_warn("[hero-reader] ELF magic 扫描未命中 (%d VMA, 游戏未加载?)\n", n);
     }
 }
 
@@ -794,102 +688,13 @@ static int scan_actor_arrays_vma(int verbose)
     return ctx.hits > 0;
 }
 
-/* 遍历 maps, 收集匿名 rw 候选区并逐区扫描; 命中即写 g_actor_begin/end。
- * verbose: 打印诊断 (open 结果 / 读入字节 / 行数 / 匿名 rw 数) — 手动 scan 时开。
- * 返回 1 = 本次调用找到。 */
+/* 纯内核态扫描: 遍历目标 mm 的 VMA, 对匿名 rw 区做特征扫描。
+ * 完全不碰 /proc, 不需要 filp_open / override_creds。 */
 static int scan_actor_arrays(int verbose)
 {
-    void *f;
-    char path[32];
-    long long pos = 0;
-    int carry = 0;
-    unsigned long read_total = 0;
-    int n, found = 0;
-    int lines = 0, heap_lines = 0, reads = 0;
-    unsigned long fval = 0;
-    struct pid_cred_ctx ctx;
-
     if (!g_target_mm || !p_access_remote_vm)
         return 0;
-    if (!p_filp_open || !p_kernel_read || !p_filp_close)
-        return 0;
-
-    snprintf(path, sizeof(path), "/proc/%d/maps", (int)g_target_pid);
-    /* 以目标进程身份打开 — 否则 kthread 域被 hidepid 拦 (-ENOENT) */
-    f = filp_open_as_pid(path, 0, 0, g_target_pid, &ctx);
-    fval = (unsigned long)f;
-    if (!f || fval >= (unsigned long)-4095UL) {
-        /* 兜底: cred 切换失败或仍被拦时, 回退纯内核 VMA 遍历 */
-        pid_cred_restore(&ctx);
-        pr_info("[hero-reader] scan: 打开 %s 失败 (rc=%lx) → 回退纯内核 VMA 遍历\n",
-                path, fval);
-        return scan_actor_arrays_vma(verbose);
-    }
-
-    for (;;) {
-        int total;
-
-        n = (int)p_kernel_read(f, g_maps_buf + carry, MAPS_WINDOW, &pos);
-        reads++;
-        if (n <= 0) {
-            if (verbose)
-                pr_info("[hero-reader] scan: kernel_read 结束 (n=%d, 已读 %lu 字节)\n",
-                        n, read_total);
-            break;
-        }
-        read_total += (unsigned long)n;
-        total = carry + n;
-
-        /* 逐行解析本窗口 */
-        {
-            int i = 0;
-
-            while (i < total) {
-                int ls = i, le = i;
-                unsigned long s = 0, e = 0;
-
-                while (le < total && g_maps_buf[le] != '\n')
-                    le++;
-                if (le >= total)
-                    break;              /* 不完整行: 留到重叠区 */
-                lines++;
-                if (maps_line_is_heap_rw(g_maps_buf, ls, le, &s, &e)) {
-                    unsigned long ab = 0;
-                    int blocks = 0;
-
-                    heap_lines++;
-                    if (g_scan_passes < SCAN_MAX_PASSES &&
-                        scan_region(s, e, &ab, &blocks)) {
-                        g_actor_begin = ab;
-                        g_actor_end = ab + (unsigned long)blocks * UNIT_LABEL_SIZE;
-                        g_scan_found++;
-                        pr_info("[hero-reader] 自动发现 Actor 数组: 0x%lx-0x%lx (%d 块, 区 0x%lx-0x%lx)\n",
-                                g_actor_begin, g_actor_end, blocks, s, e);
-                        found = 1;
-                        goto out;
-                    }
-                    g_scan_passes++;
-                }
-                i = le + 1;
-            }
-            /* 保留尾部重叠 */
-            if (total > MAPS_OVERLAP) {
-                memmove(g_maps_buf, g_maps_buf + total - MAPS_OVERLAP, MAPS_OVERLAP);
-                carry = MAPS_OVERLAP;
-            } else {
-                carry = total;
-            }
-        }
-        if (read_total > MAPS_MAX_TOTAL)
-            break;
-    }
-
-out:
-    filp_close_as_pid(f, &ctx);
-    if (verbose)
-        pr_info("[hero-reader] scan 诊断: 读 %lu 字节 (%d 次), 行=%d, 匿名rw=%d, 候选已扫=%lu\n",
-                read_total, reads, lines, heap_lines, g_scan_passes);
-    return found;
+    return scan_actor_arrays_vma(verbose);
 }
 
 /* ============================================================
@@ -1770,7 +1575,7 @@ static int reader_thread(void *data)
 
             if (g_target_mm) {
                 if (!g_base)
-                    try_read_maps_base();
+                    try_find_base_elf();
                 if (g_base) {
                     unsigned long sd = 0;
 
