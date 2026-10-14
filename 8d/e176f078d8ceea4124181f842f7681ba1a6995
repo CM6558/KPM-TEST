@@ -1,0 +1,14 @@
+docs/IDA_EVIDENCE.md
+  h_b87c1da9391a77 1-168
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "8de176f078d8ceea4124181f842f7681ba1a6995",
+  "prompts": {},
+  "humans": {
+    "h_b87c1da9391a77": {
+      "author": "CM6558 <c30080002@users.noreply.github.com>"
+    }
+  }
+}
