@@ -1,0 +1,14 @@
+docs/IDA_Offset_Confirmation.md
+  h_b87c1da9391a77 1,3,6,19,22-25,28-50,52,54-61,64,66,68,70-71,73,75-124
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "98ca5523163a3e357973b343115aa2aadec29ff4",
+  "prompts": {},
+  "humans": {
+    "h_b87c1da9391a77": {
+      "author": "CM6558 <c30080002@users.noreply.github.com>"
+    }
+  }
+}
