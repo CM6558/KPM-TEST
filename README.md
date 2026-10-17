@@ -283,6 +283,9 @@ su -c "/data/adb/ksud kpm control hero-reader 'findstatic 0x76711e1780'"
 
 ## 5. 关键内存结构
 
+> 完整偏移表与逐级推导见 [`docs/POINTER_CHAINS.md`](docs/POINTER_CHAINS.md)；
+> 定位/验证方法论见 [`docs/ANALYSIS_METHOD.md`](docs/ANALYSIS_METHOD.md)。本节是速查版。
+
 ### 5.1 原生链（libGameCore，零扫描）
 
 ```
@@ -526,7 +529,9 @@ su -c "/data/adb/ksud kpm num"           # 0
 | `overlay/java/com/hero/overlay/*.java` | OverlayService / ArrowView / MainActivity / HeroState |
 | `overlay/build.sh` | 本地打包 APK |
 | `overlay/AndroidManifest.xml` | App 清单（`com.hero.overlay`） |
-| `docs/` | 早期指针链分析（历史资料） |
+| `docs/POINTER_CHAINS.md` | 完整指针链（原生 / C# / 组件 / 相机 / 写链） |
+| `docs/ANALYSIS_METHOD.md` | 分析方法与验证流程 |
+| `docs/`（其余） | 早期指针链分析（历史资料，以 `POINTER_CHAINS.md` 为准） |
 | 本机（未入库）：`libGameCore.so` | 原生核心副本（写链/读链反汇编依据） |
 | 本机（未入库）：`libil2cpp.so` / `global-metadata.verified.dat` | il2cpp 静态分析 |
 | 本机（未入库）：`static_chain.py` / `up.py` / `slotxref.py` / `meth.py` | 静态推导 / 读内存小工具 |
@@ -576,6 +581,7 @@ su -c "/data/adb/ksud kpm num"           # 0
 
 | 日期 | 变更 |
 |---|---|
+| 2026-10-17 | 新增 `docs/POINTER_CHAINS.md`（完整指针链）与 `docs/ANALYSIS_METHOD.md`（分析方法） |
 | 2026-10-17 | **移除 `access_remote_vm` 全部使用**：删除 `prefault_range` / `touch` 命令 / KSYM 解析；内存只剩页表物理读一条路 |
 | 2026-10-17 | 新增 `setcomm` / `findpid`（传完整包名）：游戏 pid 改为**内核遍历 task 定位**，移除脚本里的 `pidof` |
 | 2026-10-17 | bin 头部 `rsv[0]=pid`、`rsv[1]=mm 已锁定`，供 `status` 显示 |
