@@ -271,18 +271,15 @@ public class OverlayService extends Service {
             for (int i = 0; i < arr.length(); i++) {
                 JSONObject h = arr.getJSONObject(i);
                 int hx = h.optInt("x"), hz = h.optInt("z");
-                if (Math.abs(hx) > 50000 || Math.abs(hz) > 50000) continue;
-                double dx = hx - myX, dz = hz - myZ;
-                double uu = dx * ux + dz * uz;
-                double vv = dx * rx + dz * rz;
+                if (Math.abs(hx) > 90000 || Math.abs(hz) > 90000) continue;
                 boolean me = h.optInt("me") == 1;
                 boolean enemy = h.getInt("camp") != myCamp;
                 boolean dead = h.optInt("dead") == 1;
                 boolean vis = h.optInt("lvis") == 1;
-                list.add(new RadarView.Item(h.optString("name", "?"), (float) uu, (float) vv,
+                list.add(new RadarView.Item(h.optString("name", "?"), (float) hx, (float) hz,
                         enemy, me, dead, vis));
             }
-            radar.setData(list, 4000f);   /* 半径 40m */
+            radar.setData(list, myCamp, 6000f);   /* 全图，±60m */
         }
         { final String itxt = haveMe
                   ? (nearest == Double.MAX_VALUE
