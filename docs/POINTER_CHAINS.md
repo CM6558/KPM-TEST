@@ -52,7 +52,9 @@ ELF image base  (VMA 扫描 + ELF magic)
                        ├─ actor + 0x34   camp (1/2)
                        ├─ actor + 0xA8 → node
                        │     node + 0x10 → link
-                       │       link + 0x2C = (x, 0, z) int32 ×1000   ★ 真值坐标
+                       │       link[0] = transform
+                       │       *(transform + 0x60) → (x, 0, z) int32 ×1000   ★ 世界坐标（雾中更新）
+                       │       （link + 0x2C 是另一份局部值；训练营里与上面同址，匹配里不是世界坐标）
                        ├─ actor - 0x758 → xyz 指针（备用路径，slot5 等异常时）
                        └─ actor + 0x1D0 → attr component
                              ├─ +0xB4 = 8192

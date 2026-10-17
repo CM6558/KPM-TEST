@@ -218,6 +218,7 @@ static volatile int           g_req_binflush   = 0;
 static volatile int           g_req_natfind    = 0;
 static volatile int           g_req_natchain   = 0;
 static volatile int           g_req_nat3      = 0;
+static volatile int           g_req_natx2     = 0;
 static volatile unsigned int  g_nf_hero = 0;
 static volatile int           g_nf_x = 0, g_nf_z = 0;
 static char                   g_hero_path[160];     /* 非空 = 写 JSON 文件供其他程序消费 */
@@ -2008,24 +2009,28 @@ static int nat_xyz(unsigned long actor, int *ox, int *oz)
 {
     unsigned long node, link, xp, c1, c2, tr;
     int xx = 0, y = 0, zz = 0;
-    /* 主链: actor+0xA8 -> node -> +0x10 -> link ; link+0x2C = (x,0,z)
-     * 强校验: link[0] = transform, transform+0x60 必须是同一个坐标 (双路径一致)。
-     * 实测: 正常对局/训练营两条路径一致 (OK); 特殊模式/异常场景会 MISMATCH,
-     * 此时直接拒绝, 交给上层回退 (避免把"别的英雄的坐标"当真值)。 */
+    /* 主链 (2026-10-17 实测, 匹配/训练营都稳定):
+     *   actor+0xA8 -> node+0x10 -> link
+     *   link[0] = transform ; *(transform+0x60) = p2
+     *   p2 = (x, 0, z) int32 ×1000      ← 世界坐标 (雾里也更新)
+     * link+0x2C 是另一份 (训练营里与 p2 同址, 匹配里是局部/未更新值), 仅作备选。 */
     node = untag(rptr(actor + NA_NODE));
     if (nat_plausible(node)) {
         link = untag(rptr(node + NODE_LINK));
         if (nat_plausible(link)) {
-            int x2 = 0, y2 = 0, z2 = 0;
-            xx = y = zz = 0;
-            rm(&xx, link + LINK_XYZ, 4); rm(&y, link + LINK_XYZ + 4, 4); rm(&zz, link + LINK_XYZ + 8, 4);
             tr = untag(rptr(link));
             if (nat_plausible(tr)) {
-                rm(&x2, tr + 0x60UL, 4); rm(&y2, tr + 0x64UL, 4); rm(&z2, tr + 0x68UL, 4);
-                if (x2 == xx && y2 == y && z2 == zz && nat_xyz_ok(xx, y, zz)) {
-                    *ox = xx; *oz = zz; return 1;
+                unsigned long p2 = untag(rptr(tr + 0x60UL));
+                if (nat_plausible(p2)) {
+                    xx = y = zz = 0;
+                    rm(&xx, p2, 4); rm(&y, p2 + 4, 4); rm(&zz, p2 + 8, 4);
+                    if (nat_xyz_ok(xx, y, zz)) { *ox = xx; *oz = zz; return 1; }
                 }
             }
+            /* 备选: link+0x2C (训练营等场景) */
+            xx = y = zz = 0;
+            rm(&xx, link + LINK_XYZ, 4); rm(&y, link + LINK_XYZ + 4, 4); rm(&zz, link + LINK_XYZ + 8, 4);
+            if (nat_xyz_ok(xx, y, zz)) { *ox = xx; *oz = zz; return 1; }
         }
     }
     /* 备链: actor+0x248 -> +0x128 -> +0x2C */
@@ -2894,6 +2899,46 @@ static void do_nat3(void)
     pr_info("[hero-reader] nat3: 结束\n");
 }
 
+
+/* natx2: 对比 link+0x2C 与 *(transform+0x60) 的值 (后者可能是世界坐标) */
+static void do_natx2(void)
+{
+    unsigned long r = nat_roster(), i;
+    if (!r) { pr_warn("[hero-reader] natx2: roster 未就绪\n"); return; }
+    pr_info("[hero-reader] natx2: 开始\n");
+    for (i = 0; i < NAT_MAX; i++) {
+        unsigned long a = untag(rptr(r + (unsigned long)i * GC_ROSTER_STRIDE));
+        unsigned long node, link, tr, p2;
+        unsigned int hero = 0, camp = 0;
+        int x1 = 0, z1 = 0, x2 = 0, y2 = 0, z2 = 0;
+        int cx = 0, cz = 0, lv = -1, k;
+        float fx2 = 0, fy2 = 0, fz2 = 0;
+        if (!nat_plausible(a)) continue;
+        if (!rm(&hero, a + NA_ID, 4) || hero == 0 || hero > 4000) continue;
+        if (!rm(&camp, a + NA_CAMP, 4) || (camp != 1 && camp != 2)) continue;
+        for (k = 0; k < (int)g_bin_n && k < 16; k++)
+            if (g_bin_rec[k].heroid == hero && g_bin_rec[k].camp == camp) {
+                cx = g_bin_rec[k].x; cz = g_bin_rec[k].z; lv = g_bin_rec[k].lvis; break;
+            }
+        node = untag(rptr(a + NA_NODE));
+        link = nat_plausible(node) ? untag(rptr(node + NODE_LINK)) : 0;
+        if (!nat_plausible(link)) continue;
+        rm(&x1, link + LINK_XYZ, 4); rm(&z1, link + LINK_XYZ + 8, 4);
+        tr = untag(rptr(link));
+        p2 = nat_plausible(tr) ? untag(rptr(tr + 0x60)) : 0;
+        if (nat_plausible(p2)) {
+            rm(&x2, p2, 4); rm(&y2, p2 + 4, 4); rm(&z2, p2 + 8, 4);
+            __builtin_memcpy(&fx2, &x2, 4);
+            __builtin_memcpy(&fy2, &y2, 4);
+            __builtin_memcpy(&fz2, &z2, 4);
+        }
+        pr_info("[hero-reader] natx2 hero=%u camp=%u lvis=%d C#=(%d,%d) | link=(%d,%d) | p2=(%d,%d,%d) f=(%d,%d,%d)\n",
+                hero, camp, lv, cx, cz, x1, z1, x2, y2, z2,
+                (int)(fx2 * 100), (int)(fy2 * 100), (int)(fz2 * 100));
+    }
+    pr_info("[hero-reader] natx2: 结束\n");
+}
+
 /* cscan <value>: 在 10 个 C# ActorLinker 对象里找该值 (int/float/缩放) */
 static int          g_cs_val = 0;
 
@@ -3106,12 +3151,16 @@ static void do_fullchain(void)
         rm(&x, link + LINK_XYZ, 4);
         rm(&z, link + LINK_XYZ + 8, 4);
         tr = untag(rptr(link));
-        if (nat_plausible(tr)) xyz2 = untag(rptr(tr + 0x60));
-        pr_info("[hero-reader] fullchain[%lu] roster+0x%lx actor=0x%lx hero=%u camp=%u "
-                "node=0x%lx link=0x%lx xyz=0x%lx (%d,0,%d) transform=0x%lx xyz2=0x%lx %s\n",
-                i, i * GC_ROSTER_STRIDE, a, hero, camp,
-                node, link, link + LINK_XYZ, x, z, tr, xyz2,
-                (xyz2 == link + LINK_XYZ) ? "OK" : "MISMATCH");
+        {
+            int wx = 0, wy = 0, wz = 0;
+            if (nat_plausible(tr)) xyz2 = untag(rptr(tr + 0x60));
+            if (nat_plausible(xyz2)) { rm(&wx, xyz2, 4); rm(&wy, xyz2 + 4, 4); rm(&wz, xyz2 + 8, 4); }
+            pr_info("[hero-reader] fullchain[%lu] roster+0x%lx actor=0x%lx hero=%u camp=%u "
+                    "node=0x%lx link=0x%lx local=(%d,0,%d) transform=0x%lx world@0x%lx=(%d,%d,%d) %s\n",
+                    i, i * GC_ROSTER_STRIDE, a, hero, camp,
+                    node, link, x, z, tr, xyz2, wx, wy, wz,
+                    (wy == 0 && nat_xyz_ok(wx, wy, wz)) ? "WORLD-OK" : "NO-WORLD");
+        }
         {   /* 附: 原生 hp/hpmax */
             unsigned long comp = untag(rptr(a + 0x1D0UL));
             int nhp = 0, nhm = 0;
@@ -3948,6 +3997,7 @@ static int reader_thread(void *data)
         if (g_req_natfind) { g_req_natfind = 0; do_natfind(g_nf_hero, g_nf_x, g_nf_z); }
         if (g_req_natchain) { g_req_natchain = 0; do_natchain(); }
         if (g_req_nat3) { g_req_nat3 = 0; do_nat3(); }
+        if (g_req_natx2) { g_req_natx2 = 0; do_natx2(); }
         if (g_req_binflush) { g_req_binflush = 0; hbin_write(); pr_info("[hero-reader] hbin: flush n=%u path=%s\n", g_bin_n, g_bin_path); }
         if (g_req_walk)   { g_req_walk = 0; do_walk(40); }
         if (g_req_chain)  { g_req_chain = 0; read_chain(); }
@@ -4128,6 +4178,9 @@ static long hero_ctl0(const char *args, char *__user out_msg, int outlen)
         if (!g_io_cred && p_get_task_cred) g_io_cred = p_get_task_cred(current);
         g_req_dumpall = 1;
         snprintf(resp, sizeof(resp), "dumpall -> %s", g_req_dumpall_path);
+    } else if (!strcmp(args, "natx2")) {
+        g_req_natx2 = 1;
+        snprintf(resp, sizeof(resp), "natx2 入队");
     } else if (!strcmp(args, "nat3")) {
         g_req_nat3 = 1;
         snprintf(resp, sizeof(resp), "nat3 入队");

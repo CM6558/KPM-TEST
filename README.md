@@ -303,11 +303,11 @@ libGameCore image base（ELF magic 定位）
   actor + 0x34    = camp (1/2)
   actor + 0xA8    → node
   node  + 0x10    → link
-  link  + 0x2C    = (x, 0, z)  int32 ×1000     ← 真值坐标
-  强校验: link[0] = transform, transform + 0x60 必须是同一组 (x,y,z)
-          （两条路径一致才采用；特殊模式会 MISMATCH，直接拒绝）
-  备路 1: actor + 0x248 → +0x128 → +0x2C
-  备路 2: actor - 0x758 → ptr → (x,0,z)
+  link[0]         = transform
+  *(transform+0x60) → (x, 0, z) int32 ×1000    ← ★ 世界坐标（雾中更新）
+  （link+0x2C 是另一份局部值；训练营里与上面同址，匹配里不是世界坐标）
+  备路: actor + 0x248 → +0x128 → +0x2C
+        actor - 0x758 → ptr → (x,0,z)
   actor + 0x1D0   → attr component
   attr + 0xC0     = hp
   attr + 0xC8     = hpmax
@@ -608,6 +608,7 @@ su -c "/data/adb/ksud kpm num"           # 0
 
 | 日期 | 变更 |
 |---|---|
+| 2026-10-17 下午 | **修正原生世界坐标链**：`*(transform+0x60)`，匹配/训练营一致，雾中持续更新；`link+0x2C` 降为备选 |
 | 2026-10-17 下午 | 方向改为屏幕基（阵营1=45°/阵营2=225°），长按悬浮窗可 45° 步进校准 |
 | 2026-10-17 下午 | 坐标读取加“双路径一致”强校验；新增备链 `0x248/0x128`；特殊模式自动拒绝 |
 | 2026-10-17 下午 | 性能：局外不再全堆扫描（曾 650ms/次）、页表翻译缓存、bin 句柄常驻、守护/桥接降频 |
