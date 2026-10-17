@@ -75,7 +75,7 @@ public class OverlayService extends Service {
         wm = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
 
         float dens = getResources().getDisplayMetrics().density;
-        int sz = (int) (170 * dens);   /* 雷达图直径 */
+        int sz = (int) (120 * dens);   /* 浮窗直径 */
 
         box = new FrameLayout(this);
         box.setBackgroundColor(Color.TRANSPARENT);
