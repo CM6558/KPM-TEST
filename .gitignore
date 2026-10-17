@@ -1,1 +1,10 @@
 hero_reader.kpm
+hero_reader.o
+overlay/base.apk
+overlay/hero.apk
+overlay/hero.apk.idsig
+overlay/classes/
+overlay/dex/
+overlay/ks.jks
+bridge/hero_bridge
+__pycache__/

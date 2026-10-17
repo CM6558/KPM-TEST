@@ -1,143 +1,586 @@
-# Hero Reader KPM — 内核态 IL2CPP 指针链读取
+# Hero Reader —— 零 hook 内核读 + 悬浮窗
 
-一个 KernelPatch Module (`.kpm`)：在**内核态（EL1）**遍历 Unity/IL2CPP 游戏的类型系统
-（domain → assemblies → image → classes → static_fields），定位并读取战斗数据，
-结果输出到内核日志。用户态不参与任何数据面操作。
+> 最后更新：2026-10-17
+> 设备：OnePlus PJZ110 / Android 16 / kernel 6.6.150 / SukiSU + KPM
+> 游戏：王者荣耀 `com.tencent.tmgp.sgame`
+> 模块名：**`hero-reader`（固定，不要版本化）**
 
-**当前进度**：指针链前半段已在真机跑通（115 个 assembly 名字全部正确、按类名可定位
-`ActorManager` 等真实类）；**最后一跳（坐标数组）待 IDA 补齐偏移** —— 详见
-[`docs/IDA_TODO.md`](docs/IDA_TODO.md) 与 [`docs/POINTER_CHAIN.md`](docs/POINTER_CHAIN.md)。
+---
+
+## 仓库布局（GitHub / 设备）
+
+仓库：<https://github.com/CM6558/KPM-TEST>
+
+| 仓库路径 | 设备路径（本机工作目录 `~/kpmwork`） | 说明 |
+|---|---|---|
+| `hero_reader.c` | `KPM-TEST-work/hero_reader.c` | 内核模块主源码 |
+| `heromap.h` | `KPM-TEST-work/heromap.h` | 英雄 id → 名字 |
+| `Makefile` / `hero_reader.lds` | `KPM-TEST-work/` | 构建 |
+| `scripts/hero_start.sh` | `~/kpmwork/hero_start.sh` → `/data/local/tmp/` | 启动 |
+| `scripts/hero_stop.sh` | `~/kpmwork/hero_stop.sh` → `/data/local/tmp/` | 停止 |
+| `scripts/deploy.sh` | `~/kpmwork/deploy.sh` | 部署 |
+| `bridge/hero_bridge.c` | `~/kpmwork/bridge/` | WS 桥接 |
+| `overlay/` | `~/kpmwork/overlay/build/` | 悬浮窗 / App |
+| `docs/` | — | 早期指针链分析（历史资料） |
+
+> 下文路径以仓库根目录为准；设备上的对应关系见上表。
+
+---
+
+## 0. 现在能做什么
+
+| 能力 | 来源 | 状态 |
+|---|---|---|
+| 英雄 id / 阵营 / objid | 原生 actor 链 | ✅ |
+| 真实坐标（雾中不冻结） | 原生 `link+0x2C`（×1000） | ✅ |
+| HP / HPmax | 原生属性组件 | ✅ |
+| C# 坐标（可见时同步的镜像） | `ActorLinker.position@0x4C4` | ✅ 仅兜底 |
+| 等级 / 金币 / 装备 / 技能 cd | C# | ✅ |
+| 逻辑可见 / 在相机 / 死亡 / 草丛 / 冰冻 | C# 标志位 | ✅ |
+| 悬浮窗 | 方向箭头 + 相机内敌人数 + 最近距离 | ✅ |
+| App 全量表格 | 每个英雄一行 + 技能行 | ✅ |
+| 游戏进程定位 | 内核遍历 task（`setcomm` / `findpid`） | ✅ 无用户态 pidof |
+
+**不做的事（硬约束）**
+
+1. 零 hook、非侵入、不阻塞渲染（纯页表物理读）。
+2. 不创建任何可枚举内核对象（无字符设备 / netlink / procfs / sysfs）。
+3. **所有游戏内存读取都在内核模块里完成**；用户态只读定长 bin / WebSocket。
+4. 悬浮窗不显示原始 JSON / 状态文本（原文只给 App 界面）。
+5. **不使用 `access_remote_vm` / `get_user_pages` / `ptrace` / `/proc/<pid>/mem`**：
+   读内存只有一条路径 `rm()` → `my_pgtable_phys()`（页表物理读）。
+6. 游戏 pid 也由内核定位（`setcomm`），用户态脚本不再 `pidof` 游戏进程。
+
+---
+
+## 1. 架构与数据流
 
 ```
-dmesg | grep hero-reader
-[hero-reader] 目标 pid=12345
-[hero-reader] 已锁定目标 mm (pid=12345)
-[hero-reader] base=0x6e90035000 (ctl0)
-[hero-reader] walk: domain=0x6e9df83ea0 assemblies=0x6ecf912c00-0x6ecf912f98 (115 个)
-[hero-reader]   asm[3] 0x6e859cf108 image=0x6e8d0378d8 classes=4067 name=Scripts.GameCore.dll
-[hero-reader] findclass: 'ActorManager' class=0x6d2c431200 image='Scripts.GameCore.dll' \
-              ns='Assets.Scripts.GameLogic' static_fields=0x6d372f6200
+               ksud kpm control hero-reader '<cmd>'
+                              │
+                              ▼
+        ┌───────────────────────────────────────┐
+        │  内核模块 hero_reader.kpm             │
+        │  · 页表物理读（my_pgtable_phys）      │
+        │  · 原生链 + C# 链                      │
+        │  · seqlock 定长 bin 写入              │
+        └───────────────┬───────────────────────┘
+                        │ /data/local/tmp/heroes.bin（64B 头 + 16×324B）
+                        ▼
+        ┌───────────────────────────────────────┐
+        │  hero_bridge（用户态，只读 bin）      │
+        │  JSON → WebSocket 127.0.0.1:8787/ws   │
+        └───────────────┬───────────────────────┘
+                        │
+            ┌───────────┴────────────┐
+            ▼                        ▼
+   OverlayService（悬浮窗）     MainActivity（App 表格）
+   箭头 / 人数 / 距离            完整 JSON 解析展示
 ```
 
-## 真机验证环境
+守护进程：`hero_start.sh --daemon` 每 200ms 给模块发一次 `heroes`（写 bin），保持模块加载 / 桥接存活；
+开局时发 `setcomm com.tencent.tmgp.sgame`，由**模块在内核遍历 task 表**定位游戏 pid（pid 失效/游戏重启会自动重定）。
 
-OnePlus PJZ110 / Android 16 / kernel `6.6.150-android15` / SukiSU Ultra（`ksud kpm` loader 3328）。
-目标 `com.tencent.tmgp.sgame`，`libil2cpp.so` 227,661,664 字节，启用 ARM MTE。
+---
 
-## 内核态完成的操作
+## 2. 快速开始
 
-| 环节 | 实现（全部内核态） |
-|------|:------------------|
-| 捕获游戏进程 pid | inline hook `access_process_vm`，比对 `task_struct->comm` 含 `sgame`/`tmgp` |
-| 锁定地址空间 | RCU 临界区内 `find_task_by_vpid` + `get_task_mm` 取 mm 引用（不持有 task_struct） |
-| 定位装载基址 | 纯内核 VMA 遍历（`find_vma`），按 `r-xp起点 − .text vaddr` 求 base |
-| 遍历类型系统 | domain → assemblies → image → class（偏移由静态反汇编确认） |
-| 按类名定位 | 内核扫描 rw 区匹配 Il2CppClass（三条判据，见下） |
-| 读目标内存 | `access_remote_vm(mm, …)` |
-| 结果输出 | `pr_info` → dmesg |
-
-## 三个真机踩出来的关键机制
-
-1. **装载基址 = maps 里第二处 file_off=0 的映射**。libil2cpp 有两处：整文件只读映射
-   和真正装载的那处。判据：`base = r-xp 映射起点 − 0x3a84000`（`.text` 的 vaddr）。
-   用错的那处 → `s_domain` 落在真空隙、读出垃圾。
-2. **ARM MTE**：指针带高位标记（形如 `0xb400006e…`），取址前必须
-   `addr & 0x0000FFFFFFFFFFFF`。
-3. **内核读 `/proc/<pid>/maps` 被 SELinux 拦**（`filp_open` 返回 `-ENOENT`）⇒
-   基址与数组定位全部改走**纯内核 VMA 遍历**（`find_vma(mm, addr)` 顺序走链表）。
-
-## 已验证的 IL2CPP 结构偏移
-
-| 结构 | 字段 | 偏移 | 验证方式 |
-|------|------|------|----------|
-| Il2CppDomain | assemblies begin / end | `+0x18` / `+0x20` | 反汇编 `0x3ace6dc`（`adrp #0xe344000 + add #0xeb8`）；与 IDA 常量吻合 |
-| Il2CppAssembly | image | `+0x00` | 反汇编 `il2cpp_assembly_get_image` |
-| Il2CppImage | name / class_count | `+0x00` / `+0x18` | 反汇编 `il2cpp_image_get_name` / `_class_count` |
-| Il2CppClass | name / namespace / static_field_data | `+0x10` / `+0x18` / `+0xB8` | 反汇编 `il2cpp_class_get_*` |
-| — | s_domain 结构体 | `base + 0xe344ea0` | 由 `0x3ace6dc` 推出 |
-
-`findclass` 判据（三条同时成立，假阳性极低）：`+0x10`→合法类名；`+0x00`→合法 image
-（其 `+0x00` 以 `.dll` 结尾）；名字匹配关键词。
-
-## 关键设计取舍
-
-1. **未定义符号只有两扇门。** loader 对模块内 UND 符号只查 KP 导出表（兜底 SukiSU
-   compact 表），**不查普通 kallsyms**。直接引用只能是 KP 导出符号和 `kf_*` kfunc 桩；
-   其余内核函数一律 `kallsyms_lookup_name()` 解析成指针并判空。手工 `extern` 内核函数名
-   会产出裸符号 → 加载期 `unknown symbol`。`scripts/check_kpm.sh` 就是拦这个的 CI 门。
-2. **绝不解析宏 / inline 名。** 6.6 上 `kthread_run` 是宏，`rcu_read_lock`/`get_task_struct`/
-   `put_task_struct` 是 static inline —— 都不是符号。改用 `kthread_create_on_node` +
-   `wake_up_process`、`__rcu_read_lock`/`__rcu_read_unlock`、`find_task_by_vpid`、
-   `get_task_mm`、`mmput`。
-3. **不持有 task_struct。** `put_task_struct` 非符号 ⇒ 只取 mm 引用
-   （`get_task_mm`），临界区外只用 `mm`，最后 `mmput()`。
-4. **结构体偏移只信 KP。** 任务字段用 KP 导出的 `task_struct_offset`（实测：只填了
-   `comm_offset`，`pid_offset` 为 -1 ⇒ 取 pid 改用真实符号 `__task_pid_nr_ns`）。
-5. **SukiSU 上 ctl0 没有字符串回传。** `ksud kpm control` 只回 int；细节一律 `pr_info`
-   进 dmesg。`compat_copy_to_user` 只在 `out_msg` 非空时调用（兼容 APatch）。
-6. **hook 回调极轻。** before 回调只做计数 + comm 比较 + 写请求槽；reader 线程是唯一的
-   状态机消费者（mm 的取放单点）。
-
-## 构建
+### 2.1 构建模块
 
 ```sh
-git clone --depth=1 https://github.com/ShirkNeko/SukiSU_KernelPatch_patch.git KernelPatch
-NDK_PATH=/path/to/android-ndk KP_DIR=$PWD/KernelPatch make
-make check                      # 产物静态自检 (scripts/check_kpm.sh)
+# 仓库根目录（设备上则是 ~/kpmwork/KPM-TEST-work）
+make KP_DIR=/path/to/KP-SUKISU                     # Termux clang
+make NDK_PATH=/path/to/android-ndk KP_DIR=...      # 或用 NDK
+sh scripts/check_kpm.sh hero_reader.kpm            # 产物自检（CI 同款）
+# 产物: hero_reader.kpm
 ```
 
-自检内容：`ET_REL` + `AArch64`、必备节 `.kpm.info/.kpm.init/.kpm.exit`、**未定义符号白名单**
-（只允许 `kf_*` 与固定 KP 导出集合）。CI 见 `.github/workflows/build.yml`。
-
-## 部署与运行
+### 2.2 部署 / 启停
 
 ```sh
-# 推包 (root; /sdcard 是 noexec)
-adb push hero_reader.kpm /sdcard/
-su -c 'cp /sdcard/hero_reader.kpm /data/local/tmp/'
-adb push scripts/vt-drive.sh /sdcard/
-su -c 'cp /sdcard/vt-drive.sh /data/local/tmp/ && chmod 755 /data/local/tmp/vt-drive.sh'
+# 仓库根 / 本机工作目录均可（deploy.sh 会自动找 KPM-TEST-work 或当前目录）
+sh scripts/deploy.sh            # 拷贝 + 先停旧实例 + 启动（推荐）
+sh scripts/deploy.sh status     # 只看状态
 
-su -c '/data/adb/ksud kpm load /data/local/tmp/hero_reader.kpm'
-
-# 一条命令驱动 (自动取 pid/base, 结果看 dmesg)
-su -c 'sh /data/local/tmp/vt-drive.sh walk'
-su -c 'sh /data/local/tmp/vt-drive.sh findclass Actor|Hero'
-su -c 'sh /data/local/tmp/vt-drive.sh dump 0x6e9df83ea0 16'
-su -c 'sh /data/local/tmp/vt-drive.sh log 30'
-
-su -c '/data/adb/ksud kpm unload hero-reader'
+# 设备上（root）
+su -c "sh /data/local/tmp/hero_start.sh"          # 启动（默认重启）
+su -c "sh /data/local/tmp/hero_start.sh keep"     # 已在跑就不动
+su -c "sh /data/local/tmp/hero_start.sh 300"      # 指定周期 300ms
+su -c "sh /data/local/tmp/hero_stop.sh"           # 停止全部
+su -c "sh /data/local/tmp/hero_stop.sh clean"     # 停止并删 heroes.bin
 ```
 
-开机自动加载：把 `.kpm` 放进 `/data/adb/kpm/`（ksud booted_load；safe mode 跳过）。
+> **必须 root 执行停止**。非 root 时脚本杀不掉守护、`rm` 也删不了 pid 文件，会留下旧实例。
 
-## ctl0 控制命令
+> **pid 来源**：脚本不再调用 `pidof` 找游戏。模块用 `setcomm com.tencent.tmgp.sgame` 在内核定位。
+> 内核 `task->comm` 只有 16 字节（最大 15 字符，实际值为 `cent.tmgp.sgame`），
+> 所以模块内部只比对**包名的后 15 位**；**调用时仍然传完整包名**。
 
-结果一律看 dmesg；SukiSU 上返回值只是 int。
+### 2.3 App / 悬浮窗
 
-| 命令 | 作用 |
-|------|------|
-| `status` / `info` | pid / mm / base / s_domain / actors / 英雄数 / hook 触发次数 |
-| `set <pid> [base]` | 设目标（base 可省） |
-| `walk` | 遍历 domain→assemblies→image，打印全部 image 名字与类数 |
-| `findclass <词\|词>` | 按类名子串找 Il2CppClass，打印 image / ns / static_fields |
-| `classes <image>` | 探测 image 的类数组偏移 |
-| `dump <addr> [n]` / `peek <addr> [n]` | 读目标内存 n 个 32 位字 |
-| `vma <addr>` | 打印 `vm_area_struct` 头部（偏移探测） |
-| `scan` / `actors` / `read` / `find` / `hunt` / `reset` | 数组扫描 / 手动指定 / 读取 / 候选搜索 / domain 反查 / 复位 |
+```sh
+cd overlay
+ANDROID_JAR=/path/to/android.jar sh build.sh   # 依赖 javac/d8/aapt2/apksigner
+adb install -r hero.apk                        # 或 su -c "pm install -r /data/local/tmp/hero.apk"
+```
+打开 App → 点「启动悬浮窗」（`isForeground=true` 即正常）。
 
-## 状态与待办
+### 2.4 改完模块后必做
 
-| 环节 | 状态 |
-|------|------|
-| 内核态 pid 捕获 / mm 锁定 / 基址定位 | ✅ 真机验证 |
-| domain→assemblies→image→class + 按类名定位 | ✅ 真机验证 |
-| 坐标数组定位（最后一跳） | ⏳ 待 IDA 偏移（见 `docs/IDA_TODO.md` B1/B2） |
+```sh
+su -c "/data/adb/ksud kpm control hero-reader 'diag on'"
+```
 
-`ACTOR_SIZE=1008` / `camp@0x08` / 坐标 `0x20,0x24,0x28` 这组旧常量在当前版本
-**未通过真机验证**（扫描命中的段坐标是垃圾值），需 IDA 重新确认。
+`diag` 是**门控**：重载后默认关闭，`classinfo / findfield / findstatic / dumpall / 扫描类命令`全部会被静默拒绝（返回值不会进 dmesg，看起来像"命令没生效"）。
 
-## 内核日志前缀
+---
 
-统一 `[hero-reader]`。关键行：`目标 pid=`、`已锁定目标 mm`、`base=`、`walk:`、
-`findclass:`、`自动发现 Actor 数组:`、`Hero Positions`、`FATAL:`、`状态复位:`。
+## 3. 数据格式
+
+### 3.1 heroes.bin（seqlock 定长）
+
+```
+struct hb_hdr {            // 64 B
+    u32 magic = 0x48523031 ("HR01"); u32 version = 1;
+    u32 seq; u32 rec_size = 324; u32 max_rec = 16; u32 n;
+    u64 ts_ms; u32 flags; u32 rsv[7];
+    // rsv[0] = 内核定位到的游戏 pid   (offset 36)
+    // rsv[1] = mm 是否已锁定 (0/1)     (offset 40)
+};
+struct hb_rec { ... }      // 324 B × 16（n 为有效条数）
+```
+
+`seq` 每写一次 +1；用户态读 `seq → 数据 → seq` 一致才算有效（桥接/App 已按此处理）。
+> bin 只在**局内**刷新；局外文件保持上一次内容（所以 `status` 会退回用 `findpid` 查 pid）。
+
+### 3.2 记录字段（偏移，小端，packed）
+
+| off | 字段 | 说明 |
+|---|---|---|
+| 0x00 | heroid, camp, objid | u32×3 |
+| 0x0C | hp, hpmax, exp, expmax, lvl, gold, incgold | i32×7 |
+| 0x28 | charge, chargemax, shield, shieldmax | i32×4 |
+| 0x38 | x, y, z, fx, fz, move, groundy | i32×7（x/z = C# 坐标，×100） |
+| 0x54 | mx, mz | i32×2（原生真值，×100） |
+| 0x5C | ad, def, res | i32×3（当前恒 0，见 §7） |
+| 0x68 | atktarget | u32 |
+| 0x6C | dead, dying, grass, freeze, battle, nomove, inroom, fantasy, autoai, lvis, cam, me | u8×12 |
+| 0x78 | eqn | u32（装备条数 ≤ 8） |
+| 0x7C | eq[8] = {u16 id, u16 cnt} | 32 B |
+| 0x9C | sk[6] = {u8 lvl,ready,lvlup,bean; i32 cd,cdmax,power,powermax,tgt,hit} | 6×28 B |
+
+### 3.3 单位（很重要）
+
+| 来源 | 单位 | 例子 |
+|---|---|---|
+| libGameCore `link+0x2C` | **×1000**（毫米） | `37453` = 37.453 m |
+| C# `ActorLinker.position`（float） | 米 | 写 bin 时 `rf32x100` → **×100** |
+| bin 里的 x/z、mx/mz | **×100**（厘米） | `3745` |
+| 悬浮窗/距离 | `/100` = 米 | `11.5m` |
+
+模块写 bin 时 `mx = native.x / 10`。**不要**在别处再乘/除 10。
+
+### 3.4 WebSocket JSON（桥接输出）
+
+```json
+{"seq":9306,"n":10,"heroes":[
+  {"heroid":107,"camp":1,"objid":0,"me":1,
+   "hp":8250,"hpmax":8250,"lvl":15,"gold":0,
+   "x":3091,"y":0,"z":475,"move":0,"fyaw":1234,"mx":3091,"mz":475,
+   "ad":0,"def":0,"res":0,
+   "dead":0,"dying":0,"grass":0,"freeze":0,"battle":0,
+   "nomove":0,"inroom":0,"fantasy":0,"autoai":0,"lvis":1,"cam":1,
+   "atktarget":0,"eqn":6,"eq":[[id,cnt],...],
+   "skills":[{"s":0,"lvl":5,"cd":0,"cdmax":8000,"ready":1,"bean":0,
+              "power":0,"powermax":0,"tgt":0,"hit":0,"lvlup":0}, ...]}
+]}
+```
+
+桥接已经把 `x/z` 换成 `mx/mz`（原生优先，无值回退 C#）。
+`fyaw` = 朝向（毫弧度，由 `fx/fz` 四元数算）。
+
+---
+
+## 4. 模块命令手册
+
+统一入口：`su -c "/data/adb/ksud kpm control hero-reader '<cmd>'"`，输出在 dmesg（`[hero-reader]` 前缀）。
+
+### 4.1 状态 / 开关
+
+| 命令 | 说明 |
+|---|---|
+| `status` / `info` | pid / mm / pgd / base / meta / dumped / comm |
+| `diag on\|off` | 诊断命令总开关（**重载后默认 off**） |
+| `verbose on\|off` | 详细日志 |
+| `unsafe on\|off` | 放开 `dumpall / findobj / scanlive` 等重扫 |
+| `set <pid> [base_hex]` | 手动指定目标进程（一般不再需要） |
+| `setcomm <完整包名>` | **内核态按包名定位 pid**（幂等；内部比对 comm 后 15 位） |
+| `findpid <完整包名>` | 一次性打印 pid（诊断，需 `diag on`） |
+| `reset` | 清空锁定状态 |
+
+### 4.2 数据读取
+
+| 命令 | 说明 |
+|---|---|
+| `native` | 打印原生链 10 条（hero/camp/xyz） |
+| `heroes` | 一次性打印 C# 英雄表（JSON 到 dmesg） |
+| `herobin <path> [ms]` | 周期写定长 bin（守护用的就是它） |
+| `herobin stop` | 停止周期写 |
+| `fullchain` | 原生链逐级校验（10 条） |
+| `nscorr` | 原生字段与 C# 交叉验证（默认 10 英雄） |
+| `classinfo <类名子串>` | 类地址 + static_fields + 字段数 |
+| `fields <类地址>` | 导出该类的字段表（偏移/类型/名） |
+| `findfield <字段名子串>` | 按字段名搜类 |
+| `findstatic <类地址>` | **遍历类表静态字段**，找谁持有该类实例（无堆扫描） |
+| `name <对象地址>` | 打印对象 klass 名 |
+| `peek <addr> [n]` | 读内存（原始） |
+| `dump <addr> [n]` | 打印 n 个 32 位字 |
+| `walk` / `chain` | 指针链探索 |
+
+### 4.3 扫描 / 反推（诊断，需 `unsafe on`）
+
+| 命令 | 说明 |
+|---|---|
+| `scanvec x y z [lo hi]` | 找连续 3 个 int32 == (x,y,z) |
+| `scanptr <hex> [lo hi]` | 找 8 字节指针值（裸/0xb4 标签） |
+| `scanval <u32>` | 找 4 字节值 |
+| `scanseq <stride>` / `scanrec` / `scanids` | 结构体序列扫描 |
+| `scanlive` | 存活对象扫描 |
+| `tabdump <base> <S> <n>` | 导表 |
+| `wide` | 放宽扫描地址限制（触页命令 `touch` 已移除） |
+| `dumpall <path>` | 导出完整类表（含字段）到文件 |
+| `findobj <类名> [off...]` | 按类名扫实例 |
+
+### 4.4 硬件断点（写链追踪）
+
+| 命令 | 说明 |
+|---|---|
+| `hwbp <tid> <addr> [len] [type]` | 挂断点（单次采样：命中即清 `DBGWCR/DBGBCR` 并自动注销） |
+| `hwbpslot <tid>` / `hwbpslot4 <tid>` | 按槽位挂 |
+| `hwbpxva <tid> <xva>` | 按 XVA 挂 |
+| `hwbp off` | 全部注销 + 复位 `g_bp_fired` |
+
+### 4.5 相机（已放弃，仅留档）
+
+`cams`（观察 `_inCamera/_rendererInCamera`）、`camcal`（进出点标定）。见 §7。
+
+### 4.6 常用组合
+
+```sh
+# 看原生 10 条
+su -c "dmesg -c >/dev/null; /data/adb/ksud kpm control hero-reader 'native'; sleep 2; dmesg | grep 'nat\[' | sed 's/.*\] //'"
+
+# 查类字段
+su -c "/data/adb/ksud kpm control hero-reader 'classinfo ActorLinker'"
+su -c "/data/adb/ksud kpm control hero-reader 'fields 0x<类地址>'"
+
+# 找静态持有者
+su -c "/data/adb/ksud kpm control hero-reader 'diag on'"
+su -c "/data/adb/ksud kpm control hero-reader 'findstatic 0x76711e1780'"
+```
+
+---
+
+## 5. 关键内存结构
+
+### 5.1 原生链（libGameCore，零扫描）
+
+```
+libGameCore image base（ELF magic 定位）
+  base + 0x53F1810            (= .bss 0x526F000 + 0x182810)  → root
+  root            → p
+  p + 0x250       → roster
+  roster[i*0x18]  → actor            (i < 16)
+  actor + 0x28    = hero cfg id
+  actor + 0x34    = camp (1/2)
+  actor + 0xA8    → node
+  node  + 0x10    → link
+  link  + 0x2C    = (x, 0, z)  int32 ×1000     ← 真值坐标
+  备路: actor - 0x758 → ptr → (x,0,z)
+  actor + 0x1D0   → attr component
+  attr + 0xC0     = hp
+  attr + 0xC8     = hpmax
+```
+
+校验规则：`y == 0`、`|x|,|z| < 300000`、hero ∈ (0,4000]、camp ∈ {1,2}。
+
+### 5.2 C# 链（il2cpp）
+
+```
+类表 s_TypeInfoTable（.bss 内有界结构区定位，find_typeinfo_table）
+  table[39479] + 0xB8 (static_fields) + 0x80  → ActorManager 实例
+  ActorManager + 0x18  → HeroActors 容器 (TVL)
+  TVL + 0x08 = items 数组, +0x10 = count
+  items[i] → ActorLinker
+  ActorManager 同 holder: static_fields + 0xE0 → GamePlayerCenter
+  GamePlayerCenter + 0x40 = hostPlayerID（自己）
+```
+
+> `table[39479]` / `+0x80` 是当前版本的常量；换版本需重新定位（`findobj ActorManager` + 静态持有者扫描已内置自动回退）。
+
+### 5.3 ActorLinker 常用偏移
+
+| 偏移 | 字段 |
+|---|---|
+| 0x028 | SkillControl → SkillLinkerComponent |
+| 0x030 | EquipComponent → EquipLinkerComponent |
+| 0x038 | resHeroCfgInfo（低 32 = 英雄 id） |
+| 0x3B8 | ValueComponent |
+| 0x3C0 | ActorControl |
+| 0x3F0 | miniMap → MinimapComponentNew（`+?` 位置） |
+| 0x410 | BuffLinkerComponent |
+| 0x480 | groundY |
+| 0x4AC | objid |
+| 0x4B0 | name |
+| 0x4B8 | forward（float xyz） |
+| 0x4C4 | position（float Vector3，米） |
+| 0x505 | `_logicVisible` |
+| 0x506 | `_meshVisible` |
+| 0x507 | `_inCamera`（受渲染/雾门控） |
+| 0x580 | staticData |
+| 0x764 | moveSpeed |
+
+### 5.4 合并规则
+
+- 原生：hero / camp / 坐标 / hp / hpmax
+- C#：等级 / 金币 / 装备 / 技能 / 可见性标志
+- 按 `(hero, camp)` 合并；C# 坐标只在原生无值（slot5 异常）时兜底。
+- `620/621` 这类非英雄单位**保留**，不按 hero id 过滤。
+
+### 5.5 写链（已完整追踪，未使用，留档）
+
+```
+0x3F49CA0  分发
+0x3F7F668  浮点变换/缩放（全局 scale = *(0x4FF4000+0x610)）
+0x3F7F08C
+0x3F7CCA0  比较 + 写（脏检查）
+0x3F7D040 → 0x3F7D074  setter: str x10,[x8]; str w9,[x8,#8]
+另一支 0x3F7C7CC → 0x3F7C3B0
+分发表 0x51B7000 槽位 +0x460/+0x4B0/+0x4C0/+0x4E0/+0x540/+0x5D0（RELA addend 已解）
+```
+
+### 5.6 内核态进程定位（替代用户态 pidof）
+
+```
+setcomm <完整包名>  →  g_target_comm 保存
+reader 线程（每 5 轮 ≈1s，仅当 pid 未锁定）:
+    RCU 下 for pid = 1..32768:
+        tsk = find_task_by_vpid(pid)
+        if tsk && comm(tsk) == 包名后 15 位  →  pid
+```
+
+- 调用方传**完整包名** `com.tencent.tmgp.sgame`；内核 `comm` 只有 15 字符
+  （实际 `cent.tmgp.sgame`），模块内部自动取尾部比对。
+- `comm_offset` 由 KP 运行时解析（本机实测 `0x830`）。
+- **注意**：本内核导出的 `task_struct_offset` 里只有 `comm_offset` 有效，
+  `pid/tgid/tasks/mm` 全是 `-1`，所以不能用 task 链表遍历，只能用 pid 循环。
+- 每次定位约扫 7000+ 个存活 pid，耗时几毫秒；pid 失效（游戏重启 / pid 复用）会自动重定。
+- 全程 RCU + 内核态，不读 `/proc`，不碰游戏内存。
+
+---
+
+## 6. 悬浮窗判定模型
+
+以「我」为原点，沿地图对角 `(+x+z)` 旋转 45° 的矩形：
+
+```
+u = (dx + dz) * 0.7071      # 前向
+v = (dx - dz) * 0.7071      # 横向
+|v| <= 1150 && -1400 <= u <= 1900      # 单位 ×100（cm）
+```
+
+- 常量来自 68 个相机进出点标定（`camcal`）。
+- 与视野无关（几何判定），雾里也算。
+- 方向 = `atan2(dz, dx)` 的**世界绝对方向**，不随朝向变化。
+- 距离 = 最近敌人的欧氏距离 `/100` 米。
+- **已知限制**：拖动相机后判定中心会偏（这是相机对象定位失败的遗留问题，见 §7）。
+
+---
+
+## 7. 已确认结论 / 放弃项（避免重复劳动）
+
+### 7.1 战斗属性 ad/def/res —— 放弃
+
+- 原生 10 英雄交叉验证 `nscorr`：**0/10**。
+- 923/545 成对搜索出的 6 处均不与赵云（id 107 / hp 8250）相邻。
+- 只出现在牛魔（168）的 `*(actor+0x170)+0x3F4`（923.0 float）。
+- 结论：界面值是**运行时计算**，不在 actor 图上。只接受最终生效值 → 拿不到就不用。
+
+### 7.2 相机标志位 —— 不可用
+
+| 字段 | 结论 |
+|---|---|
+| `_inCamera @0x507` | 受渲染/雾门控（存在 u=17.8,v=0.3 却为 0 的点） |
+| `_rendererInCamera @0x508` | 同上 |
+| `_checkRealInCamera @0x509` | 恒 0 |
+
+### 7.3 相机对象定位 —— 已放弃（用户决定）
+
+已确认的事实（下次若重启此线可直接用）：
+
+```
+Moba_Camera 类 0x765f591800
+  +0xB8 static_fields (0x77a0987920)
+    +0x0  -> 0x755a7b87c0    klass = UnityEngine.Camera ✅（纯指针，无需扫描）
+```
+
+- `UnityEngine.Camera` 在本 build **只有 7 个 static 字段**，实例数据全在原生层。
+- `UnityEngine.Object.m_CachedPtr @0x8` → 原生 Camera 指针 ✅（已读出）。
+- 原生 Camera 对象（0x76f7babe20）里未找到正交矩阵/位置字段；看到的 3×4 块不自洽。
+- `CameraSystem`（0x76711e1780，字段：`MobaCamera@0x18`, `m_mainCamera@0x48`, **`m_mainCameraTrans@0x50`**, `m_mainCamVPCache@0x58`, **`CachedFrustum@0x28`**, `bFreeCamera@0x20`）**没有任何静态引用**（`findstatic` 实测 0 命中）。
+- `Moba_Camera` 实例也没有静态引用；只有静态字段指向 UnityEngine.Camera。
+- 结论：要拿真实相机需要 **堆扫描找 CameraSystem 实例**（用户明确不要），或走 Unity GameObject→components 链 / 原生 Transform（未完成）。
+- 这条路真正的价值是 `CameraSystem.CachedFrustum`（视锥平面数组）→ 可做**精确**可见判定（含拖动/缩放/旋转），以后若重启优先它。
+
+### 7.4 其他
+
+- 等级/经验：全为同值，无法区分字段是否正确（未验证）。
+- 护盾：字段存在但未验证。
+- 技能/装备是否在原生侧存在：未验证（当前全走 C#）。
+
+---
+
+## 8. 调试与踩坑
+
+### 8.1 dmesg 被充电日志刷屏
+
+本机 `OPLUS_CHG` 每秒十几行，模块输出会被冲掉。两个办法：
+
+```sh
+# A. 实时捕获（推荐）
+su -c 'dmesg -c >/dev/null; dmesg -w > /data/local/tmp/cap.txt & DP=$!; \
+       /data/adb/ksud kpm control hero-reader "native" >/dev/null; sleep 3; kill $DP'
+su -c "grep 'hero-reader' /data/local/tmp/cap.txt"
+
+# B. 精确 grep（时间窗要短）
+su -c "dmesg -c >/dev/null; <cmd>; sleep 2; dmesg | grep -E 'findstatic|static:'"
+```
+
+> **不要**用 `pkill -f 'dmesg -w'`：命令行自己包含该字符串，会把自己杀掉。用 `kill $PID` 或 `pkill -f '[d]mesg -w'`。
+
+### 8.2 命令"没反应"= diag 没开
+
+`diag` 关闭时，诊断命令直接返回一句 `诊断命令已禁用`，**这句只通过 control 返回值给调用方，不进 dmesg**。
+所以现象是：`ksud kpm control` 返回 `0`，但 dmesg 什么都没有。
+→ 先 `diag on`。
+
+### 8.3 部署后跑的还是旧构建
+
+- 同名模块已存在时 `kpm load` 会报 `File exists`，静默失败。
+- 本机 `kpm unload` 有时第一次报 `No such file or directory`，需循环重试。
+- **现在 `deploy.sh` 已改为先 root 执行 `hero_stop.sh`（循环卸载到名字消失）再启动**；如果还怀疑，手动确认：
+
+```sh
+su -c "/data/adb/ksud kpm list"          # 必须为空
+su -c "/data/adb/ksud kpm num"           # 0
+```
+
+- `deploy.sh` 必须以 root 能力执行（脚本内部已用 `su -c`）。
+
+### 8.4 内核日志格式
+
+- `printk` **不支持 `%f`**，所有浮点要转定点/整数。
+- 日志前缀统一 `[hero-reader]`。
+
+### 8.5 进程名 / pid 相关
+
+| 现象 | 原因 |
+|---|---|
+| `findpid` 找不到 | 直接传完整包名即可（`com.tencent.tmgp.sgame`）；模块内部按 comm 后 15 位比对 |
+| `task_struct_offset.tasks_offset == -1` | 本内核只解析了 `comm_offset`，其余字段全是 -1，不能用链表遍历 |
+| `setcomm` 后没有立刻生效 | 解析有节流（每 ~1s 一次），且需游戏确实在运行 |
+| `status` 里 pid 是 `?` | bin 只在局内刷新；局外走 `findpid` 兜底，若游戏没开则为空 |
+
+### 8.6 不再有缺页触发（access_remote_vm 已移除）
+
+- `touch` 命令已删除，`prefault_range` 已删除。
+- 后果：metadata 里**未驻留**的 file-backed 页会读成 0，
+  表现为个别类名/字段名为空（`name_printable` / `cname_ok` 会过滤掉）。
+- 实测对局内绝大部分 metadata 页已驻留，`classinfo/findfield/findstatic/dumpall` 正常。
+- 如果以后发现名字缺失严重，正确做法不是恢复 `access_remote_vm`，
+  而是：① 让游戏自己先访问到那些页；② 或从磁盘 `global-metadata.dat` 解析名字。
+
+### 8.7 其他
+
+| 现象 | 原因 |
+|---|---|
+| `heroes: 未在对局 (ActorManager 失效, cnt=0)` | 不在局内 / 刚进局未初始化 / 进程重启 |
+| 模块卸载后仍有名字 | KP unload 幽灵记录；循环重试即可，不影响新实例 |
+| `pkill -f hero_start.sh` 杀到自己 | 用 `[h]ero_start.sh --daemon` 写法 |
+| 扫描命令没结果 | 需 `unsafe on`；或区域被 `wide` 限制跳过 |
+| 内存池不够 | KP `preset.h`：RW 2MB / ROX 4MB；当前占用约 0.5MB，**不需要改** |
+
+---
+
+## 9. 文件清单（重要路径）
+
+### 9.1 仓库 / Termux 工作目录
+
+| 路径 | 说明 |
+|---|---|
+| `hero_reader.c` | 模块主源码（唯一需要改的文件） |
+| `heromap.h` | 英雄 id → 名字（107=赵云、168=牛魔） |
+| `hero_reader.kpm` | 构建产物（.gitignore 忽略） |
+| `scripts/hero_start.sh` / `hero_stop.sh` / `deploy.sh` | 启停 / 部署 |
+| `bridge/hero_bridge.c` | WS 桥接源码 |
+| `overlay/java/com/hero/overlay/*.java` | OverlayService / ArrowView / MainActivity / HeroState |
+| `overlay/build.sh` | 本地打包 APK |
+| `overlay/AndroidManifest.xml` | App 清单（`com.hero.overlay`） |
+| `docs/` | 早期指针链分析（历史资料） |
+| 本机（未入库）：`libGameCore.so` | 原生核心副本（写链/读链反汇编依据） |
+| 本机（未入库）：`libil2cpp.so` / `global-metadata.verified.dat` | il2cpp 静态分析 |
+| 本机（未入库）：`static_chain.py` / `up.py` / `slotxref.py` / `meth.py` | 静态推导 / 读内存小工具 |
+
+### 9.2 设备侧 `/data/local/tmp`
+
+| 文件 | 说明 |
+|---|---|
+| `hero_reader.kpm` | 当前模块 |
+| `hero_bridge` | 桥接 |
+| `heroes.bin` | 定长数据（64B + 16×324B） |
+| `hero_start.sh` / `hero_stop.sh` | 启停 |
+| `hero_mod.name` | 模块名（`hero-reader`） |
+| `hero.log` | 守护日志 |
+| `hero_daemon.pid` / `hero_bridge.pid` | pid |
+| `all.txt` | 完整类表 dump（~7MB，`dumpall` 产物，查字段/类地址用） |
+| `hero.apk` | App 安装包 |
+
+---
+
+## 10. 下次开工 checklist（5 分钟）
+
+1. 确认设备 root / SukiSU 正常：`su -c "/data/adb/ksud kpm num"`
+2. 起服务：`sh ~/kpmwork/deploy.sh`
+3. `diag on`
+4. 进一局，确认数据：
+   ```sh
+   su -c "dmesg -c >/dev/null; /data/adb/ksud kpm control hero-reader 'native'; sleep 2; dmesg | grep 'nat\['"
+   ```
+5. 看 App / 悬浮窗是否出数
+6. 要改代码：改 `KPM-TEST-work/hero_reader.c` → `make` → `deploy.sh`
+
+---
+
+## 11. 待办 / 可继续方向
+
+- [ ] 验证等级/经验字段（当前全同值，无法区分）
+- [ ] 验证护盾（`ActorLinker` 上有字段，未确认语义）
+- [ ] 确认技能/装备是否存在于原生侧（目前全 C#）
+- [ ] （可选）把 `findstatic` 保留为常驻诊断命令（当前已内置，无副作用）
+- [ ] （若重启相机线）优先做 `CameraSystem` 实例定位 → 读 `CachedFrustum@0x28` 做精确视锥判定
+- [ ] （可选）相机拖拽检测的启发式方案（对比 `_inCamera` 与几何预测的偏差）
+
+---
+
+## 12. 变更记录
+
+| 日期 | 变更 |
+|---|---|
+| 2026-10-17 | **移除 `access_remote_vm` 全部使用**：删除 `prefault_range` / `touch` 命令 / KSYM 解析；内存只剩页表物理读一条路 |
+| 2026-10-17 | 新增 `setcomm` / `findpid`（传完整包名）：游戏 pid 改为**内核遍历 task 定位**，移除脚本里的 `pidof` |
+| 2026-10-17 | bin 头部 `rsv[0]=pid`、`rsv[1]=mm 已锁定`，供 `status` 显示 |
+| 2026-10-17 | `deploy.sh` 改为先 root 停止（循环卸载）再启动，修复"新构建加载不上" |
+| 2026-10-17 | 新增模块命令 `findstatic <类地址>`（类表静态字段遍历，无堆扫描） |
+| 2026-10-17 | 确认 `Moba_Camera._currentMobaCamera → UnityEngine.Camera`（纯指针） |
+| 2026-10-17 | 放弃相机对象定位（用户决定）；清理 `/data/local/tmp` 临时抓包文件 |
+| 2026-10-17 | 文档整理（本文件） |

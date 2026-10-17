@@ -40,7 +40,7 @@ echo "$secs" | grep -q ' .kpm.ctl0 ' || echo "note: 无 .kpm.ctl0 (可选节)"
 # ---- 3. 未定义符号白名单 ----
 # kf_*            : KP kfunc 桩 (linux/string.h、linux/kernel.h 等引入)
 # 其余固定集合    : KP 导出表里的符号 (见 SukiSU_KernelPatch_patch 的 KP_EXPORT_SYMBOL)
-allow_plain=" task_struct_offset printk kallsyms_lookup_name compat_copy_to_user hook_wrap hook_unwrap_remove "
+allow_plain=" task_struct_offset mm_struct_offset printk kallsyms_lookup_name compat_copy_to_user hook_wrap hook_unwrap_remove sp_el0_is_current sp_el0_is_thread_info task_in_thread_info_offset thread_info_in_task thread_size "
 und="$("$READELF" -sW "$KPM" | awk '$7=="UND" && $8!=""{print $8}' | sort -u)"
 if [ -z "$und" ]; then
     die "未定义符号为空 (可疑 — 至少应有 printk / kallsyms_lookup_name)"
