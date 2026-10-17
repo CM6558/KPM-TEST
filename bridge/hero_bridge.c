@@ -109,8 +109,10 @@ static int build_json(const volatile uint8_t *m) {
         { float qy, qw; memcpy(&qy, &r->fx, 4); memcpy(&qw, &r->fz, 4);
           fyaw = (int)(atan2f(2.0f*qw*qy, 1.0f - 2.0f*qy*qy) * 1000.0f); }   /* 朝向 yaw (毫弧度) */
         /* 优先 native 链坐标 (mx/mz, 无值时回退 C# 镜像); 雾中 C# 会冻结, native 不会 */
-        px = (r->mx || r->mz) ? r->mx : r->x;
-        pz = (r->mx || r->mz) ? r->mz : r->z;
+        /* 原生坐标只在两个轴都有效时采用: 实测会偶发 (0,z) 脏值,
+         * 否则会把最近敌人算错 (箭头/距离/人数全错)。 */
+        px = (r->mx && r->mz) ? r->mx : r->x;
+        pz = (r->mx && r->mz) ? r->mz : r->z;
         o += snprintf(g_json+o, sizeof(g_json)-o,
             "%s{\"heroid\":%u,\"camp\":%u,\"objid\":%u,\"me\":%u,"
             "\"hp\":%d,\"hpmax\":%d,\"lvl\":%d,\"gold\":%d,"
@@ -214,7 +216,7 @@ int main(int argc, char **argv) {
         FD_ZERO(&rf);
         FD_SET(lfd, &rf);
         if (cfd >= 0) FD_SET(cfd, &rf);
-        tv.tv_sec = 0; tv.tv_usec = 5000;  /* 5ms */
+        tv.tv_sec = 0; tv.tv_usec = 20000; /* 20ms: 数据 200ms 一帧, 降低空转唤醒 */
         r = select((cfd > lfd ? cfd : lfd) + 1, &rf, NULL, NULL, &tv);
         if (r < 0) { if (errno == EINTR) continue; break; }
         if (r == 0) { /* timeout -> 检查新帧 + 心跳 */

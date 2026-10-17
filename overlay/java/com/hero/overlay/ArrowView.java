@@ -28,7 +28,7 @@ public class ArrowView extends View {
         setBackground(bg);
     }
 
-    /** 角度：世界坐标 atan2(dz,dx)，0°=+x(右)，90°=+z(上) */
+    /** 屏幕方向角（已按阵营做世界→屏幕变换）：0°=屏幕右，90°=屏幕上 */
     public void setAngle(float d) {
         if ((d < 0) != (deg < 0) || Math.abs(d - deg) > 0.2f) {
             deg = d;

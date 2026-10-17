@@ -18,6 +18,7 @@ import android.view.WindowManager;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -41,9 +42,17 @@ public class OverlayService extends Service {
     private static final String TAG = "heroov";
     /* 相机可见区模型: 以我为原点, 沿地图对角 (+x+z) 为前向的矩形
      * 单位 = 世界坐标 ×100 (cm)。前方比后方远, 横向 = 屏幕宽度。 */
-    private static final double CAM_HALF_W = 1150;   /* 横向半宽 11.5m (实测标定) */
+    private static final double CAM_HALF_W = 1150;   /* 横向半宽 11.5m (实测标定, 阵营1屏幕基) */
     private static final double CAM_FRONT  = 1900;   /* 前方 19m */
     private static final double CAM_BACK   = 1400;   /* 后方 14m */
+    /* 屏幕基: 世界坐标 -> 屏幕方向
+     * 阵营1(左下): 屏幕上方 = 世界 45°  (即 (+x,+z) 对角)
+     * 阵营2(右上): 屏幕上方 = 世界 225° (地图视角旋转 180°)
+     * 标定常量是在阵营1的屏幕基下得到的; 阵营2 用同一矩形, 基向量旋转 180°。 */
+    /* 屏幕基角度（阵营1）。长按悬浮窗每次 +45°，实时校准并持久化。
+     * 阵营2 = 基准 + 180°（地图视角旋转 180°）。 */
+    private int upDegBase = 45;
+    private double upDegOf(int camp) { return (upDegBase + (camp == 2 ? 180 : 0)) % 360; }
 
     private WindowManager wm;
     private FrameLayout box;
@@ -51,6 +60,7 @@ public class OverlayService extends Service {
     private TextView info;
     private WindowManager.LayoutParams lp;
     private float downX, downY; private int startX, startY;
+    private long downTime; private boolean moved;
 
     private volatile boolean running = true;
     private double myX, myZ; private int myCamp, myFyaw;
@@ -96,16 +106,29 @@ public class OverlayService extends Service {
                 PixelFormat.TRANSLUCENT);
         lp.gravity = Gravity.TOP | Gravity.START; lp.x = 60; lp.y = 220;
 
+        upDegBase = getSharedPreferences("hero", MODE_PRIVATE).getInt("updeg", 45);
         box.setOnTouchListener((v, e) -> {
             switch (e.getActionMasked()) {
                 case MotionEvent.ACTION_DOWN:
                     downX = e.getRawX(); downY = e.getRawY();
                     startX = lp.x; startY = lp.y;
+                    downTime = System.currentTimeMillis(); moved = false;
                     return true;
                 case MotionEvent.ACTION_MOVE:
+                    if (Math.abs(e.getRawX() - downX) > 24 || Math.abs(e.getRawY() - downY) > 24) moved = true;
                     lp.x = startX + (int) (e.getRawX() - downX);
                     lp.y = startY + (int) (e.getRawY() - downY);
                     try { wm.updateViewLayout(box, lp); } catch (Exception ignored) {}
+                    return true;
+                case MotionEvent.ACTION_UP:
+                case MotionEvent.ACTION_CANCEL:
+                    /* 长按 (>0.7s) 且没拖动 -> 方向基准 +45° */
+                    if (!moved && System.currentTimeMillis() - downTime > 700) {
+                        upDegBase = (upDegBase + 45) % 360;
+                        getSharedPreferences("hero", MODE_PRIVATE).edit().putInt("updeg", upDegBase).apply();
+                        Toast.makeText(this, "方向基准 " + upDegBase + "°（阵营1）",
+                                Toast.LENGTH_SHORT).show();
+                    }
                     return true;
             }
             return false;
@@ -198,6 +221,13 @@ public class OverlayService extends Service {
         int near = 0;
         double nearest = Double.MAX_VALUE, ndx = 0, ndz = 0;
         int nlvis = -1, nhero = 0;
+        /* 箭头优先指向"可见"的最近敌人: 雾里敌人的原生坐标目前不可靠,
+         * 用它会让箭头乱跳。没有可见敌人时才退回最近敌人。 */
+        double nearestVis = Double.MAX_VALUE, vdx = 0, vdz = 0;
+        /* 屏幕基向量 (世界坐标, 单位向量): up=屏幕上, right=屏幕右 */
+        double upRad   = Math.toRadians(upDegOf(myCamp));
+        double ux = Math.cos(upRad), uz = Math.sin(upRad);
+        double rx = Math.cos(upRad - Math.PI / 2.0), rz = Math.sin(upRad - Math.PI / 2.0);
         if (haveMe) {
             for (int i = 0; i < arr.length(); i++) {
                 JSONObject h = arr.getJSONObject(i);
@@ -207,20 +237,25 @@ public class OverlayService extends Service {
                 if (Math.abs(hx) > 50000 || Math.abs(hz) > 50000) continue;   /* 哨兵值/无效坐标, 不算敌人 */
                 double dx = hx - myX, dz = hz - myZ;
                 double d = Math.hypot(dx, dz);
-                /* 几何判定(与视野无关): 沿地图对角旋转 45° 的矩形
-                 * u=前向, v=横向; 常量由 68 个进出点标定 */
-                double u = (dx + dz) * 0.70710678;
-                double v = (dx - dz) * 0.70710678;
+                /* 几何判定(与视野无关): 屏幕基下的矩形
+                 * u=屏幕上方(前), v=屏幕右方; 常量由 68 个进出点标定(阵营1) */
+                double u = dx * ux + dz * uz;
+                double v = dx * rx + dz * rz;
                 if (Math.abs(v) <= CAM_HALF_W && u <= CAM_FRONT && u >= -CAM_BACK) near++;
                 if (d < nearest) { nearest = d; ndx = dx; ndz = dz; nlvis = h.optInt("lvis"); nhero = h.getInt("heroid"); }
+                if (h.optInt("lvis") == 1 && d < nearestVis) { nearestVis = d; vdx = dx; vdz = dz; }
             }
         }
+        if (nearestVis != Double.MAX_VALUE) { nearest = nearestVis; ndx = vdx; ndz = vdz; }
         String arrowCh = "-";
         String dir = "-";
         double degAll = -1;
         if (nearest != Double.MAX_VALUE) {
-            /* (ndx,ndz) = 敌 - 我 (世界坐标), +x=右 +z=上 */
-            double deg = Math.toDegrees(Math.atan2(ndz, ndx));
+            /* (ndx,ndz) = 敌 - 我 (世界坐标) -> 投影到屏幕基
+             * ArrowView: 0°=屏幕右, 90°=屏幕上 */
+            double nu = ndx * ux + ndz * uz;
+            double nv = ndx * rx + ndz * rz;
+            double deg = Math.toDegrees(Math.atan2(nu, nv));
             if (deg < 0) deg += 360.0;
             degAll = deg;
             int k = (int) Math.round(deg / 45.0) % 8;

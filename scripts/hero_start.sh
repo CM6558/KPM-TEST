@@ -55,22 +55,34 @@ if [ "$1" = --daemon ]; then
     trap 'p=$(cat "$DPID" 2>/dev/null); [ "$p" = "$$" ] && rm -f "$DPID"; exit 0' TERM INT
     ensure_loaded
     echo "[$(ts)] 守护启动, 周期 ${IV}ms, 游戏 $GAME (内核态定位 $GAME_COMM)"
-    CUR=""
+    CUR=""; N=0
     while :; do
-        # 注意: 这里绝不能 ensure_loaded(它会先卸载), 否则每秒重装模块
-        mod_loaded || "$KSUD" kpm load "$MOD" >/dev/null 2>&1
-        # setcomm 幂等: 同名不会重置状态; 模块会自己处理游戏重启/pid 复用
-        "$KSUD" kpm control "$MNAME" "setcomm $GAME_COMM" >/dev/null 2>&1
-        if [ "$CUR" != "1" ]; then
-            "$KSUD" kpm control "$MNAME" "herobin $BIN $IV" >/dev/null 2>&1
-            echo "[$(ts)] 内核定位 $GAME_COMM, herobin ${IV}ms"
-            CUR=1
+        # 每 30 轮 (≈60s) 才做一次模块检查/重发 setcomm, 避免频繁 spawn ksud
+        if [ $((N % 30)) -eq 0 ]; then
+            if ! mod_loaded; then
+                "$KSUD" kpm load "$MOD" >/dev/null 2>&1
+                CUR=""
+            fi
+            "$KSUD" kpm control "$MNAME" "setcomm $GAME_COMM" >/dev/null 2>&1
+            if [ "$CUR" != "1" ]; then
+                "$KSUD" kpm control "$MNAME" "herobin $BIN $IV" >/dev/null 2>&1
+                echo "[$(ts)] 内核定位 $GAME_COMM, herobin ${IV}ms"
+                CUR=1
+            fi
         fi
-        if ! pidof hero_bridge >/dev/null 2>&1; then
+        # 桥接保活: 读 pid 文件 + 内建 read 检查 comm, 不 spawn pidof
+        BP=$(cat "$BPID" 2>/dev/null)
+        ALIVE=0
+        if [ -n "$BP" ]; then
+            read -r BC < "/proc/$BP/comm" 2>/dev/null || BC=""
+            [ "$BC" = "hero_bridge" ] && ALIVE=1
+        fi
+        if [ "$ALIVE" = 0 ]; then
             setsid "$BRIDGE" "$BIN" "$PORT" >/dev/null 2>&1 </dev/null &
             echo $! > "$BPID"
             echo "[$(ts)] 桥接已起 ws://127.0.0.1:$PORT/ws"
         fi
+        N=$((N+1))
         sleep 2
     done
 fi

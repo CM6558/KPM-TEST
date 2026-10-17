@@ -141,6 +141,19 @@ static pid_t          g_target_pid = 0;
 static void          *g_target_mm  = NULL;
 static pid_t          g_mm_pid     = 0;
 static char           g_target_comm[64] = {0};   /* 非空 = 内核态按进程名自动定位 pid */
+
+/* 页表翻译缓存: 同一 VA 页的重复读不再逐级 walk (64 项直接映射) */
+static unsigned long  g_ptc_va[64], g_ptc_pa[64];
+/* 性能统计 (每 50 个周期打印一次) */
+static long long (*p_ktime_get_ns)(void);   /* 指向 ktime_get (返回 ns) */
+static unsigned int   g_pf_cycles = 0, g_pf_scans = 0;
+static int            g_in_match = 0;
+static int            g_nat_gate = 1;   /* 1=可见时用 C# 校验原生坐标; 0=完全信任原生 */          /* 局内/局外状态, 用于降频与日志限流 */
+static unsigned long long g_pf_total_us = 0, g_pf_max_us = 0;
+static unsigned int   g_pf_slow = 0;
+static unsigned int   g_bin_no_native = 0, g_bin_mm_fallback = 0, g_bin_bad_native = 0;                       /* >3ms 的轮数 */
+static unsigned long long g_bw_total_us = 0, g_bw_max_us = 0;
+static unsigned int   g_bw_n = 0;
 static unsigned long  g_pgd        = 0;
 static unsigned long  g_base       = 0;
 static unsigned long  g_gc_base    = 0;
@@ -201,6 +214,12 @@ static char                   g_req_fo_name[48];
 static volatile int           g_req_findpid    = 0;
 static char                   g_req_fp_name[64];
 static volatile int           g_req_heroes     = 0;
+static volatile int           g_req_binflush   = 0;
+static volatile int           g_req_natfind    = 0;
+static volatile int           g_req_natchain   = 0;
+static volatile int           g_req_nat3      = 0;
+static volatile unsigned int  g_nf_hero = 0;
+static volatile int           g_nf_x = 0, g_nf_z = 0;
 static char                   g_hero_path[160];     /* 非空 = 写 JSON 文件供其他程序消费 */
 
 /* heroes.json 头部字段说明 (_doc) */
@@ -256,6 +275,7 @@ static int                    g_bin_interval = 0;   /* ms, >0 周期 */
 static unsigned int           g_bin_seq = 0;
 static int                    g_bin_created = 0;
 static unsigned int           g_bin_ts = 0;
+static void                  *g_bin_filp = NULL;   /* 常驻打开, 避免每轮 filp_open */
 static struct hb_rec          g_bin_rec[HB_MAXREC];
 static unsigned int           g_bin_n = 0;
 
@@ -355,10 +375,17 @@ static int rm(void *dst, unsigned long uaddr, int len)
         unsigned long pgsz = 1UL << g_page_shift;
         unsigned long pgoff = uaddr & (pgsz - 1);
         unsigned long chunk = pgsz - pgoff;
+        unsigned long va_page = uaddr & ~(pgsz - 1);
         unsigned long pa;
+        unsigned idx = (unsigned int)((va_page >> 12) & 63UL);
         if (chunk > (unsigned long)len)
             chunk = (unsigned long)len;
-        pa = my_pgtable_phys(g_pgd, uaddr);
+        if (g_ptc_va[idx] == va_page)
+            pa = g_ptc_pa[idx] + pgoff;
+        else {
+            pa = my_pgtable_phys(g_pgd, uaddr);
+            if (pa) { g_ptc_pa[idx] = pa & ~(pgsz - 1); g_ptc_va[idx] = va_page; }
+        }
         if (pa) {
             memcpy(d, (void *)pa_to_kva(pa & ~(pgsz - 1)) + pgoff, chunk);   /* -> kf_memcpy */
         } else {
@@ -789,9 +816,10 @@ static unsigned long find_typeinfo_table(unsigned long *cnt)
     /* 零扫描快路径: 类表指针存放在固定 .bss 槽 base+0xE345028 */
     if (g_base) {
         unsigned long t = rptr(g_base + 0xE345028UL);
-        int ok = t ? table_ok(t) : 0;
-        if (g_verbose) pr_info("[hero-reader] 零扫描? base+0xE345028 -> 0x%lx ok=%d\n", t, ok);
-        if (ok) { if (!g_tbl_n) g_tbl_n = 70000; g_tbl = t; if (cnt) *cnt = g_tbl_n; return t; }
+        if (t && t == g_tbl) { if (cnt) *cnt = g_tbl_n ? g_tbl_n : 70000; return t; }   /* 已校验过, 零读 */
+        { int ok = t ? table_ok(t) : 0;
+          if (g_verbose) pr_info("[hero-reader] 零扫描? base+0xE345028 -> 0x%lx ok=%d\n", t, ok);
+          if (ok) { if (!g_tbl_n) g_tbl_n = 70000; g_tbl = t; if (cnt) *cnt = g_tbl_n; return t; } }
     }
     /* 缓存: 类表已解析且仍有效 → 直接返回, 不再扫 .bss */
     if (g_tbl && table_ok(g_tbl)) {
@@ -1751,29 +1779,42 @@ static int hscan_cb(void *udata, unsigned long start, unsigned long end, unsigne
 }
 
 /* 校验 ActorManager 实例是否仍有效 (klass == ActorManager 且 HeroActors 容器是 TinyValueList) */
-static int am_valid(unsigned long inst, unsigned long amc)
+/* 只校验"实例还活着": klass 对 + HeroActors 是 TinyValueList。
+ * 注意: 不能把 cnt==0 当成失效 —— 局外/结算时 cnt 就是 0,
+ * 那样会每轮触发一次全堆扫描 (实测空闲 CPU 被吃掉 60%)。 */
+static int am_alive(unsigned long inst, unsigned long amc)
 {
     unsigned long cont, cls;
     char nm[48];
     if (!inst || untag(rptr(inst)) != amc)
         return 0;
     cont = rptr(inst + OFF_AM_HEROACTORS);
-    cls = rptr(cont);
-    if (!cls || rstr(rptr(cls + CLASS_NAME_O), nm, sizeof(nm)) <= 0 || !strstr(nm, "TinyValueList"))
+    if (!cont)
         return 0;
-    {   /* HeroActors 数量必须合理, 否则视为失效 (对局已结束等) */
-        unsigned int cnt = 0;
-        rm(&cnt, cont + OFF_TVL_COUNT, 4);
-        if (cnt == 0 || cnt > 64)
-            return 0;
-    }
-    return 1;
+    cls = rptr(cont);
+    if (!cls)
+        return 0;
+    if (rstr(rptr(cls + CLASS_NAME_O), nm, sizeof(nm)) <= 0)
+        return 1;                       /* 名字页未驻留: 不据此判失效, 避免触发扫描 */
+    return strstr(nm, "TinyValueList") != NULL;
+}
+
+static int am_valid(unsigned long inst, unsigned long amc)
+{
+    unsigned long cont;
+    unsigned int cnt = 0;
+    if (!am_alive(inst, amc))
+        return 0;
+    cont = rptr(inst + OFF_AM_HEROACTORS);
+    rm(&cnt, cont + OFF_TVL_COUNT, 4);
+    return cnt > 0 && cnt <= 64;
 }
 
 /* 把 g_bin_rec/g_bin_n 作为定长 seqlock 文件写出 (首次建到定长, 之后原地覆盖) */
 static void hbin_write(void)
 {
     void *f = NULL, *old_cred = NULL;
+    unsigned long long t0 = p_ktime_get_ns ? p_ktime_get_ns() : 0;
     struct hb_hdr *H = (struct hb_hdr *)g_iobuf;
     unsigned long hdr_sz = sizeof(struct hb_hdr), rec_sz = sizeof(struct hb_rec);
     unsigned long total = hdr_sz + HB_MAXREC * rec_sz;
@@ -1791,27 +1832,47 @@ static void hbin_write(void)
     H->seq = g_bin_seq;                              /* 偶数=稳定 */
     if (g_bin_n) memcpy(g_iobuf + hdr_sz, g_bin_rec, g_bin_n * rec_sz);
 
+    /* SELinux 在 write 时也会做 file_permission 检查, 所以 creds 覆盖必须包住 open+write,
+     * 不能只在 open 时覆盖 (否则内核线程上下文写入被拒, O_TRUNC 后留下 0 字节文件)。 */
     if (g_io_cred && p_override_creds) old_cred = p_override_creds(g_io_cred);
-    f = p_filp_open(g_bin_path,
-                    KPM_O_WRONLY | KPM_O_CREAT | (first ? KPM_O_TRUNC : 0), 0644);
-    if (!f || (unsigned long)f >= (unsigned long)-4095UL) {
-        if (old_cred && p_revert_creds) p_revert_creds(old_cred);
-        return;
+
+    if (!g_bin_filp) {
+        g_bin_filp = p_filp_open(g_bin_path,
+                        KPM_O_WRONLY | KPM_O_CREAT | (first ? KPM_O_TRUNC : 0), 0644);
+        if (!g_bin_filp || (unsigned long)g_bin_filp >= (unsigned long)-4095UL) {
+            g_bin_filp = NULL;
+            if (old_cred && p_revert_creds) p_revert_creds(old_cred);
+            return;
+        }
     }
+    f = g_bin_filp;
     g_bin_created = 1;
 
-    if (first) {
-        p = 0; p_kernel_write(f, g_iobuf, total, &p);     /* 建到定长, magic/version 就位 */
-    } else {
-        unsigned int odd = g_bin_seq + 1, even = g_bin_seq + 2;
-        p = 8;  p_kernel_write(f, &odd, 4, &p);           /* seq = 奇 (写入中) */
-        p = 0;  p_kernel_write(f, g_iobuf, 8, &p);        /* magic/version 每次都补上 (文件被删过也能修好) */
-        p = 12; p_kernel_write(f, g_iobuf + 12, total - 12, &p);
-        g_bin_seq = even;
-        p = 8;  p_kernel_write(f, &even, 4, &p);          /* seq = 偶 (稳定) */
+    {
+        int ok = 1;
+        if (first) {
+            p = 0;
+            ok = (p_kernel_write(f, g_iobuf, total, &p) == (long)total);
+        } else {
+            unsigned int odd = g_bin_seq + 1, even = g_bin_seq + 2;
+            p = 8;  p_kernel_write(f, &odd, 4, &p);       /* seq = 奇 (写入中) */
+            p = 0;  p_kernel_write(f, g_iobuf, 8, &p);    /* magic/version 每次都补上 */
+            p = 12; p_kernel_write(f, g_iobuf + 12, total - 12, &p);
+            g_bin_seq = even;
+            p = 8;  p_kernel_write(f, &even, 4, &p);      /* seq = 偶 (稳定) */
+        }
+        if (!ok) {
+            pr_warn("[hero-reader] hbin: 首次写入失败, 重建文件\n");
+            if (g_bin_filp && p_filp_close) p_filp_close(g_bin_filp, NULL);
+            g_bin_filp = NULL; g_bin_created = 0;
+        }
     }
-    p_filp_close(f, NULL);
     if (old_cred && p_revert_creds) p_revert_creds(old_cred);
+    if (t0 && p_ktime_get_ns) {
+        unsigned long long dt = (p_ktime_get_ns() - t0) / 1000ULL;
+        g_bw_n++; g_bw_total_us += dt;
+        if (dt > g_bw_max_us) g_bw_max_us = dt;
+    }
 }
 
 
@@ -1897,24 +1958,40 @@ static unsigned long gc_base(void)
     return g_gc_base;
 }
 
+static int nat_xyz(unsigned long actor, int *ox, int *oz);
+
+/* 快速校验 roster: 前 16 个槽里至少要有 5 个合法 actor (hero/camp/坐标) */
+static int nat_roster_ok(unsigned long r)
+{
+    int i, ok = 0;
+    if (!nat_plausible(r)) return 0;
+    for (i = 0; i < NAT_MAX; i++) {
+        unsigned long a = untag(rptr(r + (unsigned long)i * GC_ROSTER_STRIDE));
+        unsigned int hero = 0, camp = 0;
+        int x = 0, z = 0;
+        if (!nat_plausible(a)) continue;
+        if (!rm(&hero, a + NA_ID, 4) || hero == 0 || hero > 4000) continue;
+        if (!rm(&camp, a + NA_CAMP, 4) || (camp != 1 && camp != 2)) continue;
+        if (!nat_xyz(a, &x, &z)) continue;
+        ok++;
+    }
+    return ok >= 5;
+}
+
 static unsigned long nat_roster(void)
 {
     struct nat_cand c;
-    if (g_nat_roster) {
-        if (nat_plausible(rptr(g_nat_roster))) return g_nat_roster;
-        g_nat_roster = 0;
-    }
-    {   /* 纯静态常量: base + GC_ROOT_VA -> p + 0x250 -> roster */
+    /* 先走静态链 (3 次读): 换局/换进程后 root 会变, 不能先信缓存 */
+    {
         unsigned long b = gc_base();
         if (b) {
             unsigned long p = rptr(b + GC_ROOT_VA);
             unsigned long r = nat_plausible(p) ? rptr(p + GC_ROSTER_PTR_OFF) : 0;
-            if (nat_plausible(r)) {
-                g_nat_roster = r;
-                return r;
-            }
+            if (nat_roster_ok(r)) { g_nat_roster = r; return r; }
         }
     }
+    if (g_nat_roster && nat_roster_ok(g_nat_roster)) return g_nat_roster;
+    g_nat_roster = 0;
     c.roster = 0;
     vma_walk(nat_scan_cb, &c);
     if (c.roster) g_nat_roster = c.roster;
@@ -1929,14 +2006,35 @@ static int nat_xyz_ok(int xx, int y, int zz)
 
 static int nat_xyz(unsigned long actor, int *ox, int *oz)
 {
-    unsigned long node, link, xp;
+    unsigned long node, link, xp, c1, c2, tr;
     int xx = 0, y = 0, zz = 0;
+    /* 主链: actor+0xA8 -> node -> +0x10 -> link ; link+0x2C = (x,0,z)
+     * 强校验: link[0] = transform, transform+0x60 必须是同一个坐标 (双路径一致)。
+     * 实测: 正常对局/训练营两条路径一致 (OK); 特殊模式/异常场景会 MISMATCH,
+     * 此时直接拒绝, 交给上层回退 (避免把"别的英雄的坐标"当真值)。 */
     node = untag(rptr(actor + NA_NODE));
     if (nat_plausible(node)) {
         link = untag(rptr(node + NODE_LINK));
         if (nat_plausible(link)) {
+            int x2 = 0, y2 = 0, z2 = 0;
             xx = y = zz = 0;
             rm(&xx, link + LINK_XYZ, 4); rm(&y, link + LINK_XYZ + 4, 4); rm(&zz, link + LINK_XYZ + 8, 4);
+            tr = untag(rptr(link));
+            if (nat_plausible(tr)) {
+                rm(&x2, tr + 0x60UL, 4); rm(&y2, tr + 0x64UL, 4); rm(&z2, tr + 0x68UL, 4);
+                if (x2 == xx && y2 == y && z2 == zz && nat_xyz_ok(xx, y, zz)) {
+                    *ox = xx; *oz = zz; return 1;
+                }
+            }
+        }
+    }
+    /* 备链: actor+0x248 -> +0x128 -> +0x2C */
+    c1 = untag(rptr(actor + 0x248UL));
+    if (nat_plausible(c1)) {
+        c2 = untag(rptr(c1 + 0x128UL));
+        if (nat_plausible(c2)) {
+            xx = y = zz = 0;
+            rm(&xx, c2 + LINK_XYZ, 4); rm(&y, c2 + LINK_XYZ + 4, 4); rm(&zz, c2 + LINK_XYZ + 8, 4);
             if (nat_xyz_ok(xx, y, zz)) { *ox = xx; *oz = zz; return 1; }
         }
     }
@@ -1958,7 +2056,7 @@ static int nat_collect(struct nat_rec *out, int max)
         unsigned long a = untag(rptr(r + i * GC_ROSTER_STRIDE));
         unsigned int hero = 0, camp = 0;
         int x = 0, z = 0;
-        if (!nat_plausible(a)) break;
+        if (!nat_plausible(a)) continue;
         if (!rm(&hero, a + NA_ID, 4) || hero == 0 || hero > 4000) continue;
         if (!rm(&camp, a + NA_CAMP, 4) || (camp != 1 && camp != 2)) continue;
         if (!nat_xyz(a, &x, &z)) continue;
@@ -2515,6 +2613,287 @@ static void do_nativescan(void)
 }
 
 
+/* natfind <hero> <x_cm> <z_cm>: 用 C# 坐标作参照, 在同一次读里扫描 native actor
+ * (本体 + 一级指针), 找出坐标真实所在偏移。仅诊断用。 */
+static void do_natfind(unsigned int hero, int px, int pz)
+{
+    unsigned long r = nat_roster(), i, off, k2, k3;
+    int tx = px * 10, tz = pz * 10, tol = 800;          /* 整数: ×1000 */
+    float fx = px / 100.0f, fz = pz / 100.0f;            /* 浮点: 米 */
+    char *buf2 = g_iobuf + 0x40000;
+    char *buf3 = g_iobuf + 0x80000;
+    if (!r) { pr_warn("[hero-reader] natfind: roster 未就绪\n"); return; }
+    pr_info("[hero-reader] natfind: hero=%u target int=(%d,%d) float=(%d,%d)cm\n",
+            hero, tx, tz, px, pz);
+#define NF_CHK(base, off, tag) do { \
+        int _vx = 0, _vy = 0, _vz = 0; float _fx, _fz; \
+        __builtin_memcpy(&_vx, (base) + (off), 4); \
+        __builtin_memcpy(&_vy, (base) + (off) + 4, 4); \
+        __builtin_memcpy(&_vz, (base) + (off) + 8, 4); \
+        __builtin_memcpy(&_fx, (base) + (off), 4); \
+        __builtin_memcpy(&_fz, (base) + (off) + 8, 4); \
+        if (_vy == 0 && _vx > tx - tol && _vx < tx + tol && _vz > tz - tol && _vz < tz + tol) \
+            pr_info("[hero-reader] natfind: %s int (%d,0,%d)\n", tag, _vx, _vz); \
+        else if (_fx > fx - 1.0f && _fx < fx + 1.0f && _fz > fz - 1.0f && _fz < fz + 1.0f) \
+            pr_info("[hero-reader] natfind: %s float (%.2f,%.2f)\n", tag, (double)_fx, (double)_fz); \
+    } while (0)
+    for (i = 0; i < NAT_MAX; i++) {
+        unsigned long a = untag(rptr(r + i * GC_ROSTER_STRIDE));
+        unsigned int h = 0, c = 0;
+        if (!nat_plausible(a)) continue;
+        if (!rm(&h, a + NA_ID, 4) || h != hero) continue;
+        rm(&c, a + NA_CAMP, 4);
+        pr_info("[hero-reader] natfind: actor=0x%lx camp=%u slot=%lu\n", a, c, i);
+        if (!rm(g_iobuf, a, 0x1000)) continue;
+        for (off = 0; off + 12 <= 0x1000; off += 4) NF_CHK(g_iobuf, off, "d0b");
+        for (off = 0; off + 8 <= 0x1000; off += 8) {
+            unsigned long v, u;
+            __builtin_memcpy(&v, g_iobuf + off, 8);
+            u = v & PTR_MASK;
+            if (!nat_plausible(u) || u == a) continue;
+            if ((v >> 56) != 0 && (v >> 56) != 0xb4UL) continue;
+            if (!rm(buf2, u, 0x800)) continue;
+            for (k2 = 0; k2 + 12 <= 0x800; k2 += 4) NF_CHK(buf2, k2, "d1");
+            for (k2 = 0; k2 + 8 <= 0x800; k2 += 8) {
+                unsigned long v2, u2;
+                __builtin_memcpy(&v2, buf2 + k2, 8);
+                u2 = v2 & PTR_MASK;
+                if (!nat_plausible(u2) || u2 == u || u2 == a) continue;
+                if ((v2 >> 56) != 0 && (v2 >> 56) != 0xb4UL) continue;
+                if (!rm(buf3, u2, 0x400)) continue;
+                for (k3 = 0; k3 + 12 <= 0x400; k3 += 4) {
+                    int vx = 0, vy = 0, vz = 0;
+                    __builtin_memcpy(&vx, buf3 + k3, 4);
+                    __builtin_memcpy(&vy, buf3 + k3 + 4, 4);
+                    __builtin_memcpy(&vz, buf3 + k3 + 8, 4);
+                    if (vy == 0 && vx > tx - tol && vx < tx + tol && vz > tz - tol && vz < tz + tol)
+                        pr_info("[hero-reader] natfind: d2 a+0x%lx -> 0x%lx +0x%lx -> 0x%lx +0x%lx = (%d,0,%d)\n",
+                                off, u, k2, u2, k3, vx, vz);
+                }
+            }
+        }
+    }
+#undef NF_CHK
+    pr_info("[hero-reader] natfind: 结束\n");
+}
+
+
+/* ============================================================ natchain
+ * 用"同一时刻 10 个英雄的 C# 坐标"做交叉约束, 暴力枚举 offset 链:
+ *   d0: actor + o
+ *   d1: *(actor + o1) + o2
+ * 只保留对 >=6 个英雄同时成立的 (o1,o2)。用来找稳定的坐标链。 */
+struct nc_t { unsigned int hero, camp; int tx, tz; unsigned long a; };
+static struct nc_t g_nc_h[16];
+static int          g_nc_nh = 0;
+static unsigned int g_nc_c1[2048], g_nc_c2[2048];
+static int          g_nc_nc = 0;
+
+static int nc_match3(char *b, unsigned long lim, unsigned long off, int tx, int tz, int tol)
+{
+    int vx = 0, vy = 0, vz = 0;
+    float fx, fy, fz;
+    if (off + 12 > lim) return 0;
+    __builtin_memcpy(&vx, b + off, 4);
+    __builtin_memcpy(&vy, b + off + 4, 4);
+    __builtin_memcpy(&vz, b + off + 8, 4);
+    if (vx > tx - tol && vx < tx + tol && vz > tz - tol && vz < tz + tol) return 1;   /* 不再要求 y==0 */
+    /* 也匹配 float 版本 (米), 容差 4m */
+    __builtin_memcpy(&fx, b + off, 4);
+    __builtin_memcpy(&fy, b + off + 4, 4);
+    __builtin_memcpy(&fz, b + off + 8, 4);
+    {
+        float mx = tx / 1000.0f, mz = tz / 1000.0f;
+        if (fx > mx - 4.0f && fx < mx + 4.0f && fz > mz - 4.0f && fz < mz + 4.0f) return 1;
+    }
+    return 0;
+}
+
+/* 给第 hi 个英雄枚举 d1 候选, 结果写到 out (o1<<16|o2) */
+static int nc_enum_d1(int hi, unsigned int *out, int max)
+{
+    unsigned long a = g_nc_h[hi].a;
+    int tx = g_nc_h[hi].tx, tz = g_nc_h[hi].tz, tol = 400;
+    char *body = g_iobuf;
+    char *buf  = g_iobuf + 0x40000;
+    unsigned long o1, o2;
+    int n = 0;
+    if (!rm(body, a, 0x1000)) return 0;
+    for (o1 = 0; o1 + 8 <= 0x1000; o1 += 8) {
+        unsigned long v, u;
+        __builtin_memcpy(&v, body + o1, 8);
+        u = v & PTR_MASK;
+        if (!nat_plausible(u) || u == a) continue;
+        if ((v >> 56) != 0 && (v >> 56) != 0xb4UL) continue;
+        if (!rm(buf, u, 0x800)) continue;
+        for (o2 = 0; o2 + 12 <= 0x800; o2 += 4) {
+            if (!nc_match3(buf, 0x800, o2, tx, tz, tol)) continue;
+            if (n < max) out[n] = ((unsigned int)(o1 & 0xFFFF) << 16) | (unsigned int)(o2 & 0xFFFF);
+            n++;
+        }
+    }
+    return n;
+}
+
+static void do_natchain(void)
+{
+    unsigned long r = nat_roster();
+    int i, k, nh = 0, nc, ci, hi;
+    static unsigned int cand[2048];
+    char *body = g_iobuf;
+    int d0_hit[0x1000 / 4];
+    int d0_n = 0;
+
+    memset(d0_hit, 0, sizeof(d0_hit));
+    if (!r) { pr_warn("[hero-reader] natchain: roster 未就绪\n"); return; }
+    /* 1. 目标集合: 用 do_heroes 刚写的 g_bin_rec (C# x/z, ×100) */
+    for (k = 0; k < (int)g_bin_n && k < 16; k++) {
+        unsigned int hero = g_bin_rec[k].heroid, camp = g_bin_rec[k].camp;
+        int tx, tz;
+        unsigned long a = 0;
+        if (!hero || !g_bin_rec[k].x || !g_bin_rec[k].z) continue;
+        tx = g_bin_rec[k].x * 10; tz = g_bin_rec[k].z * 10;
+        for (i = 0; i < NAT_MAX; i++) {
+            unsigned long aa = untag(rptr(r + (unsigned long)i * GC_ROSTER_STRIDE));
+            unsigned int hh = 0, cc = 0;
+            if (!nat_plausible(aa)) continue;
+            if (!rm(&hh, aa + NA_ID, 4) || !rm(&cc, aa + NA_CAMP, 4)) continue;
+            if (hh == hero && cc == camp) { a = aa; break; }
+        }
+        if (!a) continue;
+        g_nc_h[nh].hero = hero; g_nc_h[nh].camp = camp;
+        g_nc_h[nh].tx = tx; g_nc_h[nh].tz = tz; g_nc_h[nh].a = a;
+        nh++;
+    }
+    g_nc_nh = nh;
+    pr_info("[hero-reader] natchain: 目标=%d\n", nh);
+    if (nh < 6) { pr_warn("[hero-reader] natchain: 目标不足\n"); return; }
+
+    /* 2. 深度 0: actor+off 直接命中 (所有英雄同一 off) */
+    for (i = 0; i < nh; i++) {
+        if (!rm(body, g_nc_h[i].a, 0x1000)) return;
+        for (k = 0; k + 12 <= 0x1000; k += 4)
+            if (nc_match3(body, 0x1000, (unsigned long)k, g_nc_h[i].tx, g_nc_h[i].tz, 400))
+                d0_hit[k / 4]++;
+    }
+    for (k = 0; k + 12 <= 0x1000; k += 4)
+        if (d0_hit[k / 4] >= nh) { pr_info("[hero-reader] natchain: d0 actor+0x%x 命中 %d/%d\n", k, d0_hit[k/4], nh); d0_n++; }
+    if (!d0_n) pr_info("[hero-reader] natchain: d0 无稳定偏移\n");
+
+    /* 3. 深度 1: 用第 0 个英雄枚举, 再让其余英雄过滤 */
+    nc = nc_enum_d1(0, cand, 2048);
+    pr_info("[hero-reader] natchain: d1 初始候选=%d\n", nc);
+    if (nc > 2048) nc = 2048;
+    for (hi = 1; hi < nh && nc > 0; hi++) {
+        int keep = 0;
+        for (ci = 0; ci < nc; ci++) {
+            unsigned long o1 = (cand[ci] >> 16) & 0xFFFF;
+            unsigned long o2 = cand[ci] & 0xFFFF;
+            unsigned long v, u;
+            char *buf = g_iobuf + 0x40000;
+            int ok = 0;
+            if (!rm(body, g_nc_h[hi].a, 0x1000)) continue;
+            __builtin_memcpy(&v, body + o1, 8);
+            u = v & PTR_MASK;
+            if (nat_plausible(u) && u != g_nc_h[hi].a && rm(buf, u, 0x800))
+                ok = nc_match3(buf, 0x800, o2, g_nc_h[hi].tx, g_nc_h[hi].tz, 400);
+            if (ok) cand[keep++] = cand[ci];
+        }
+        nc = keep;
+        pr_info("[hero-reader] natchain: 过滤到英雄 %d 后候选=%d\n", hi, nc);
+    }
+    for (ci = 0; ci < nc && ci < 20; ci++)
+        pr_info("[hero-reader] natchain: d1 actor+0x%lx -> +0x%lx  (稳定)\n",
+                (cand[ci] >> 16) & 0xFFFF, cand[ci] & 0xFFFF);
+
+    /* 4. 深度 2: 只对英雄0枚举, 其余英雄验证 */
+    if (nc == 0) {
+        char *b1 = g_iobuf + 0x40000;
+        char *b2 = g_iobuf + 0x80000;
+        unsigned long o1, o2, o3;
+        int hits = 0;
+        if (rm(body, g_nc_h[0].a, 0x1000)) {
+            for (o1 = 0; o1 + 8 <= 0x400; o1 += 8) {
+                unsigned long v1, p1;
+                __builtin_memcpy(&v1, body + o1, 8);
+                p1 = v1 & PTR_MASK;
+                if (!nat_plausible(p1) || p1 == g_nc_h[0].a) continue;
+                if ((v1 >> 56) != 0 && (v1 >> 56) != 0xb4UL) continue;
+                if (!rm(b1, p1, 0x800)) continue;
+                for (o2 = 0; o2 + 8 <= 0x400; o2 += 8) {
+                    unsigned long v2, p2;
+                    __builtin_memcpy(&v2, b1 + o2, 8);
+                    p2 = v2 & PTR_MASK;
+                    if (!nat_plausible(p2) || p2 == p1 || p2 == g_nc_h[0].a) continue;
+                    if ((v2 >> 56) != 0 && (v2 >> 56) != 0xb4UL) continue;
+                    if (!rm(b2, p2, 0x400)) continue;
+                    for (o3 = 0; o3 + 12 <= 0x400; o3 += 4) {
+                        int hi2, good = 1;
+                        if (!nc_match3(b2, 0x400, o3, g_nc_h[0].tx, g_nc_h[0].tz, 400)) continue;
+                        for (hi2 = 1; hi2 < nh && good; hi2++) {
+                            unsigned long w1, q1, w2, q2, t1 = 0, t2 = 0, t3 = 0;
+                            char *c1 = g_iobuf + 0x40000, *c2 = g_iobuf + 0x80000;
+                            if (!rm(body, g_nc_h[hi2].a, 0x1000)) { good = 0; break; }
+                            __builtin_memcpy(&w1, body + o1, 8); q1 = w1 & PTR_MASK;
+                            if (!nat_plausible(q1) || !rm(c1, q1, 0x800)) { good = 0; break; }
+                            __builtin_memcpy(&w2, c1 + o2, 8); q2 = w2 & PTR_MASK;
+                            if (!nat_plausible(q2) || !rm(c2, q2, 0x400)) { good = 0; break; }
+                            good = nc_match3(c2, 0x400, o3, g_nc_h[hi2].tx, g_nc_h[hi2].tz, 400);
+                        }
+                        if (good) {
+                            pr_info("[hero-reader] natchain: d2 actor+0x%lx -> +0x%lx -> +0x%lx (稳定 %d/%d)\n",
+                                    o1, o2, o3, nh, nh);
+                            if (++hits > 10) goto d2done;
+                        }
+                    }
+                }
+            }
+        }
+d2done:
+        pr_info("[hero-reader] natchain: d2 稳定链=%d\n", hits);
+    }
+    pr_info("[hero-reader] natchain: 结束 稳定链=%d\n", nc);
+}
+
+
+/* 打印三条已确认稳定的候选坐标链 (用于判断哪条是雾中真值) */
+static void do_nat3(void)
+{
+    unsigned long r = nat_roster();
+    int i, k;
+    static const unsigned long A[3] = {0x110, 0x128, 0x170};
+    static const unsigned long B[3] = {0x420, 0x560, 0x3c8};
+    if (!r) { pr_warn("[hero-reader] nat3: roster 未就绪\n"); return; }
+    pr_info("[hero-reader] nat3: 开始\n");
+    for (i = 0; i < NAT_MAX; i++) {
+        unsigned long a = untag(rptr(r + (unsigned long)i * GC_ROSTER_STRIDE));
+        unsigned int hero = 0, camp = 0;
+        int cx = 0, cz = 0;
+        int v[3][2];
+        int lv = -1;
+        if (!nat_plausible(a)) continue;
+        if (!rm(&hero, a + NA_ID, 4) || hero == 0 || hero > 4000) continue;
+        if (!rm(&camp, a + NA_CAMP, 4) || (camp != 1 && camp != 2)) continue;
+        for (k = 0; k < (int)g_bin_n && k < 16; k++) {
+            if (g_bin_rec[k].heroid == hero && g_bin_rec[k].camp == camp) {
+                cx = g_bin_rec[k].x; cz = g_bin_rec[k].z; lv = g_bin_rec[k].lvis; break;
+            }
+        }
+        for (k = 0; k < 3; k++) {
+            unsigned long p1 = untag(rptr(a + A[k])), p2 = 0;
+            v[k][0] = 0; v[k][1] = 0;
+            if (!nat_plausible(p1)) continue;
+            p2 = untag(rptr(p1 + B[k]));
+            if (!nat_plausible(p2)) continue;
+            rm(&v[k][0], p2 + LINK_XYZ, 4);
+            rm(&v[k][1], p2 + LINK_XYZ + 8, 4);
+        }
+        pr_info("[hero-reader] nat3 hero=%u camp=%u lvis=%d C#=(%d,%d) | A=(%d,%d) B=(%d,%d) C=(%d,%d)\n",
+                hero, camp, lv, cx, cz, v[0][0], v[0][1], v[1][0], v[1][1], v[2][0], v[2][1]);
+    }
+    pr_info("[hero-reader] nat3: 结束\n");
+}
+
 /* cscan <value>: 在 10 个 C# ActorLinker 对象里找该值 (int/float/缩放) */
 static int          g_cs_val = 0;
 
@@ -2856,15 +3235,22 @@ static void do_heroes(void)
         unsigned long cand = rptr(rptr(cls + CLASS_STATIC_FIELDS) + 0x80UL);
         if (g_verbose) pr_info("[hero-reader] 静态链 cls=0x%lx inst=0x%lx valid=%d\n",
                                cls, cand, am_valid(cand, amc));
-        if (am_valid(cand, amc)) { g_am_inst = cand; inst = cand; goto have_inst; }
+        if (am_alive(cand, amc)) { g_am_inst = cand; inst = cand; goto have_inst; }
     }
-    /* 缓存 + 每次校验; 无效才扫一次 (开新对局时) */
-    if (am_valid(g_am_inst, amc)) {
+    /* 缓存 + 每次校验; 无效才扫一次 (开新对局时)
+     * 注意: 全堆扫描实测一次 ~650ms, 会造成明显卡顿。
+     * 静态链 (table[idx].static_fields) 已能覆盖换局, 所以扫描默认禁用,
+     * 只有诊断时 'unsafe on' 才允许。 */
+    if (am_alive(g_am_inst, amc)) {
         inst = g_am_inst;
+    } else if (!g_allow_scan) {
+        if (g_verbose) pr_info("[hero-reader] heroes: 实例未就绪, 等下一轮 (扫描已禁用)\n");
+        return;
     } else {
         hs.amc = amc; hs.inst = 0; hs.found = 0;
+        g_pf_scans++;
         vma_walk(hscan_cb, &hs);
-        if (!hs.found) { pr_warn("[hero-reader] heroes: 未找到 ActorManager 实例 (未在对局?)\n"); return; }
+        if (!hs.found) { if (g_verbose) pr_warn("[hero-reader] heroes: 未找到 ActorManager 实例\n"); return; }
         inst = hs.inst;
         g_am_inst = inst;
         /* 找持有该实例的类 (static_fields[0] == instance) → 得到纯静态链 */
@@ -2892,7 +3278,7 @@ have_inst:
     arr  = rptr(cont + OFF_TVL_ITEMS);
     rm(&cnt, cont + OFF_TVL_COUNT, 4);
     if (!arr || !cnt || cnt > 64) {
-        pr_warn("[hero-reader] heroes: 未在对局 (ActorManager 失效, cnt=%lu)\n", cnt);
+        if (g_in_match) { g_in_match = 0; pr_info("[hero-reader] 对局结束/未在对局\n"); }
         return;
     }
 
@@ -2924,7 +3310,7 @@ have_inst:
             int n = snprintf(line, sizeof(line), "{\"_doc\":%s,\"seq\":%lu,\"n\":%lu,\"heroes\":[\n", g_hero_doc, g_hero_seq++, cnt);
             p_kernel_write(f, line, (unsigned long)n, &pos);
         } else if (g_verbose) {
-            pr_info("[hero-reader] heroes: ActorManager=0x%lx 英雄数=%u\n", inst, cnt);
+            if (!g_in_match) { g_in_match = 1; pr_info("[hero-reader] 对局开始 heroes=%u\n", cnt); }
         }
 
         { int nn = nat_collect(nrt, NAT_MAX); if (g_verbose) pr_info("[hero-reader] native 表: roster=0x%lx n=%d\n", g_nat_roster, nn); nrn = nn; }
@@ -3068,18 +3454,28 @@ have_inst:
                   rm(&qy, a + 0x4D4UL, 4); rm(&qw, a + 0x4DCUL, 4);
                   rb->fx = (int)qy; rb->fz = (int)qw; }
                 rb->move = move; rb->groundy = groundy;
-                {   /* 优先 native 链 (libGameCore 原生 actor), 回退小地图组件 m_actorPos */
-                    unsigned long mc = rptr(a + AL_MINIMAP);
+                {   /* 坐标只走原生链 (libGameCore actor); 不再回退小地图组件 */
                     int kk, got = 0;
                     rb->mx = 0; rb->mz = 0;
-                    if (mc) { rb->mx = rf32x100(mc + MM_ACTORPOS); rb->mz = rf32x100(mc + MM_ACTORPOS + 8UL); }
                     for (kk = 0; kk < nrn; kk++) {
                         if (nrt[kk].hero == herocfg && nrt[kk].camp == (unsigned int)(camp + 1)) {
-                            rb->mx = nrt[kk].x / 10;   /* x1000 -> x100, 与 x/z 同单位 */
-                            rb->mz = nrt[kk].z / 10;
+                            int nx = nrt[kk].x / 10, nz = nrt[kk].z / 10;   /* x1000 -> x100 */
+                            if (nx && nz) { rb->mx = nx; rb->mz = nz; }
                             if (nrt[kk].hp > 0) { hp = nrt[kk].hp; }        /* 原生优先 */
                             if (nrt[kk].hpmax > 0) { hpmax = nrt[kk].hpmax; }
                             got = 1; break;
+                        }
+                    }
+                    if (!got) g_bin_no_native++;
+                    /* 可见时用 C# 位置交叉校验原生值: 偏差>5m 说明这次原生读坏了,
+                     * 丢弃并让桥接回退 C# (宁可暂时没有真值, 也不喂错坐标)。 */
+                    if (g_nat_gate && lvis && (rb->mx || rb->mz)) {
+                        int cx = rf32x100(a + AL_POS), cz = rf32x100(a + AL_POS + 8);
+                        if (cx && cz) {
+                            int ddx = rb->mx - cx, ddz = rb->mz - cz;
+                            if (ddx > 500 || ddx < -500 || ddz > 500 || ddz < -500) {
+                                rb->mx = 0; rb->mz = 0; g_bin_bad_native++;
+                            }
                         }
                     }
                     (void)got;
@@ -3432,6 +3828,8 @@ static void refresh_pgd(void)
     g_pgd = 0;
     if (g_target_mm && mm_struct_offset.pgd_offset > 0)
         __builtin_memcpy(&g_pgd, (char *)g_target_mm + mm_struct_offset.pgd_offset, 8);
+    memset(g_ptc_va, 0, sizeof(g_ptc_va));   /* 换 mm / 重锁后翻译缓存必须失效 */
+    memset(g_ptc_pa, 0, sizeof(g_ptc_pa));
 }
 
 static void reset_state(void)
@@ -3531,7 +3929,26 @@ static int reader_thread(void *data)
             pr_info("[hero-reader] hwbp: 已单次命中, 事件已自动注销\n"); }
         if (g_req_scanvec_valid) { g_req_scanvec_valid = 0; do_scanvec(); }
         if (g_req_scanptr_valid) { g_req_scanptr_valid = 0; do_scanptr(); }
-        if (g_req_heroes || g_hero_interval > 0 || g_bin_interval > 0) { g_req_heroes = 0; do_heroes(); }
+        if (g_req_heroes || g_hero_interval > 0 || g_bin_interval > 0) {
+            unsigned long long t0 = p_ktime_get_ns ? p_ktime_get_ns() : 0;
+            g_req_heroes = 0;
+            do_heroes();
+            if (t0) {
+                unsigned long long dt = (p_ktime_get_ns() - t0) / 1000ULL;
+                g_pf_cycles++; g_pf_total_us += dt;
+                if (dt > g_pf_max_us) g_pf_max_us = dt;
+                if (dt > 3000ULL) g_pf_slow++;
+                if ((g_pf_cycles % 50) == 0)
+                    pr_info("[hero-reader] perf: n=%u avg=%lluus max=%lluus slow=%u scans=%u bin_avg=%lluus bin_max=%lluus nonat=%u mmfb=%u\n",
+                            g_pf_cycles, g_pf_total_us / g_pf_cycles, g_pf_max_us, g_pf_slow, g_pf_scans,
+                            g_bw_n ? g_bw_total_us / g_bw_n : 0ULL, g_bw_max_us,
+                            g_bin_no_native, g_bin_mm_fallback + g_bin_bad_native);
+            }
+        }
+        if (g_req_natfind) { g_req_natfind = 0; do_natfind(g_nf_hero, g_nf_x, g_nf_z); }
+        if (g_req_natchain) { g_req_natchain = 0; do_natchain(); }
+        if (g_req_nat3) { g_req_nat3 = 0; do_nat3(); }
+        if (g_req_binflush) { g_req_binflush = 0; hbin_write(); pr_info("[hero-reader] hbin: flush n=%u path=%s\n", g_bin_n, g_bin_path); }
         if (g_req_walk)   { g_req_walk = 0; do_walk(40); }
         if (g_req_chain)  { g_req_chain = 0; read_chain(); }
         if (g_req_peek_valid) { g_req_peek_valid = 0; do_peek(g_req_peek_addr, g_req_peek_count); }
@@ -3541,6 +3958,7 @@ static int reader_thread(void *data)
 
         { int iv = g_hero_interval > 0 ? g_hero_interval : 0;
           if (g_bin_interval > 0 && (iv == 0 || g_bin_interval < iv)) iv = g_bin_interval;
+          if (!g_in_match && iv < 1000) iv = 1000;      /* 局外降频, 减少空转与日志 */
           p_msleep(iv > 0 ? (iv < 50 ? 50 : iv) : 1000); }
     }
     return 0;
@@ -3564,6 +3982,7 @@ static long hero_init(const char *args, const char *event, void *reserved)
     KSYM_OPT(void *(*)(void *, void *, void *, void *), register_user_hw_breakpoint, "register_user_hw_breakpoint");
     KSYM_OPT(void (*)(void *), unregister_hw_breakpoint, "unregister_hw_breakpoint");
     KSYM_OPT(void *(*)(int), find_get_task_by_vpid, "find_get_task_by_vpid");
+    KSYM_OPT(long long (*)(void), ktime_get_ns, "ktime_get");
     KSYM_OPT(void *(*)(int), find_get_pid, "find_get_pid");
     KSYM_OPT(void *(*)(void *, int), get_pid_task, "get_pid_task");
     KSYM_OPT(void (*)(void *), put_pid, "put_pid");
@@ -3652,6 +4071,7 @@ static long hero_exit(void *reserved)
     if (g_kthread) { p_kthread_stop(g_kthread); g_kthread = NULL; }
     /* 卸载前必须注销所有硬件断点: 否则事件回调指针指向已释放的模块内存 */
     hr_bp_clear();
+    if (g_bin_filp && p_filp_close) { p_filp_close(g_bin_filp, NULL); g_bin_filp = NULL; }
     if (g_target_mm) { p_mmput(g_target_mm); g_target_mm = NULL; }
     if (g_io_cred && p_put_cred) { p_put_cred(g_io_cred); g_io_cred = NULL; }
     return 0;
@@ -3708,14 +4128,52 @@ static long hero_ctl0(const char *args, char *__user out_msg, int outlen)
         if (!g_io_cred && p_get_task_cred) g_io_cred = p_get_task_cred(current);
         g_req_dumpall = 1;
         snprintf(resp, sizeof(resp), "dumpall -> %s", g_req_dumpall_path);
+    } else if (!strcmp(args, "nat3")) {
+        g_req_nat3 = 1;
+        snprintf(resp, sizeof(resp), "nat3 入队");
+    } else if (!strcmp(args, "natchain")) {
+        g_req_natchain = 1;
+        snprintf(resp, sizeof(resp), "natchain 入队");
+    } else if (!strncmp(args, "natfind ", 8)) {
+        const char *p = args + 8; long hv = 0, xv = 0, zv = 0;
+        g_req_natfind = 0;
+        while (*p == ' ') p++;
+        while (*p >= '0' && *p <= '9') { hv = hv * 10 + (*p - '0'); p++; }
+        while (*p == ' ') p++;
+        { int neg = 0; if (*p == '-') { neg = 1; p++; }
+          while (*p >= '0' && *p <= '9') { xv = xv * 10 + (*p - '0'); p++; }
+          if (neg) xv = -xv; }
+        while (*p == ' ') p++;
+        { int neg = 0; if (*p == '-') { neg = 1; p++; }
+          while (*p >= '0' && *p <= '9') { zv = zv * 10 + (*p - '0'); p++; }
+          if (neg) zv = -zv; }
+        if (hv > 0) {
+            g_nf_hero = (unsigned int)hv; g_nf_x = (int)xv; g_nf_z = (int)zv;
+            g_req_natfind = 1;
+            snprintf(resp, sizeof(resp), "natfind hero=%ld (%ld,%ld) 入队", hv, xv, zv);
+        } else snprintf(resp, sizeof(resp), "natfind 用法: natfind <hero> <x_cm> <z_cm>");
+    } else if (!strncmp(args, "natgate", 7)) {
+        const char *p = args + 7;
+        while (*p == ' ') p++;
+        if (strstr(p, "off") || *p == '0') g_nat_gate = 0;
+        else if (strstr(p, "on") || *p == '1') g_nat_gate = 1;
+        else g_nat_gate = !g_nat_gate;
+        snprintf(resp, sizeof(resp), "native 校验门=%d (%s)", g_nat_gate,
+                 g_nat_gate ? "可见时用C#校验" : "完全信任原生");
+    } else if (!strcmp(args, "binflush")) {
+        g_req_binflush = 1;
+        snprintf(resp, sizeof(resp), "binflush 入队 (n=%u)", g_bin_n);
     } else if (!strncmp(args, "herobin", 7)) {
         const char *p = args + 7;
         while (*p == ' ') p++;
         if (!strncmp(p, "stop", 4)) {
             g_bin_interval = 0; g_bin_path[0] = 0;
+            if (g_bin_filp && p_filp_close) { p_filp_close(g_bin_filp, NULL); g_bin_filp = NULL; }
             snprintf(resp, sizeof(resp), "herobin 周期输出已停止");
         } else {
             int l = 0;
+            /* 换路径时先释放旧句柄, 否则会一直写旧 inode */
+            if (g_bin_filp && p_filp_close) { p_filp_close(g_bin_filp, NULL); g_bin_filp = NULL; }
             g_bin_path[0] = 0; g_bin_interval = 0;
             if (*p) {
                 while (*p && *p != ' ' && l < (int)sizeof(g_bin_path) - 1) g_bin_path[l++] = *p++;
