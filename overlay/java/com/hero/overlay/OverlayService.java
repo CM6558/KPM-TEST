@@ -221,9 +221,8 @@ public class OverlayService extends Service {
         int near = 0;
         double nearest = Double.MAX_VALUE, ndx = 0, ndz = 0;
         int nlvis = -1, nhero = 0;
-        /* 箭头优先指向"可见"的最近敌人: 雾里敌人的原生坐标目前不可靠,
-         * 用它会让箭头乱跳。没有可见敌人时才退回最近敌人。 */
-        double nearestVis = Double.MAX_VALUE, vdx = 0, vdz = 0;
+        /* 箭头目标 = 最近敌人（不看视野）。原生坐标是雾中真值，
+         * 敌人刚消失也要继续指向它，而不是切到下一个可见敌人。 */
         /* 屏幕基向量 (世界坐标, 单位向量): up=屏幕上, right=屏幕右 */
         double upRad   = Math.toRadians(upDegOf(myCamp));
         double ux = Math.cos(upRad), uz = Math.sin(upRad);
@@ -243,10 +242,9 @@ public class OverlayService extends Service {
                 double v = dx * rx + dz * rz;
                 if (Math.abs(v) <= CAM_HALF_W && u <= CAM_FRONT && u >= -CAM_BACK) near++;
                 if (d < nearest) { nearest = d; ndx = dx; ndz = dz; nlvis = h.optInt("lvis"); nhero = h.getInt("heroid"); }
-                if (h.optInt("lvis") == 1 && d < nearestVis) { nearestVis = d; vdx = dx; vdz = dz; }
+
             }
         }
-        if (nearestVis != Double.MAX_VALUE) { nearest = nearestVis; ndx = vdx; ndz = vdz; }
         String arrowCh = "-";
         String dir = "-";
         double degAll = -1;
