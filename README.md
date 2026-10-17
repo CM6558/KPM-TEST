@@ -184,7 +184,7 @@ struct hb_rec { ... }      // 324 B × 16（n 为有效条数）
 
 ```json
 {"seq":9306,"n":10,"heroes":[
-  {"heroid":107,"camp":1,"objid":0,"me":1,
+  {"heroid":107,"camp":1,"objid":0,"me":1,"name":"赵云",
    "hp":8250,"hpmax":8250,"lvl":15,"gold":0,
    "x":3091,"y":0,"z":475,"move":0,"fyaw":1234,"mx":3091,"mz":475,
    "ad":0,"def":0,"res":0,

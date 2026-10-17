@@ -65,7 +65,8 @@ public class MainActivity extends Activity {
             }
             sb.append(String.format(Locale.US, "seq=%d  n=%d  我方=%s\n",
                     o.optInt("seq"), o.optInt("n"), haveMe ? ("阵营" + meCamp) : "未识别"));
-            sb.append("阵 英雄 对象   HP/HPmax  Lv   金币   距离  C#坐标(x,z)     原生坐标(x,z)   V C D 装备\n");
+            sb.append("名称(ID)   阵 距离   位置(x,z) m     视野 屏   HP/HPmax    Lv 金币    装备\n");
+            sb.append("----------------------------------------------------------------------------\n");
             for (int i = 0; i < arr.length(); i++) {
                 JSONObject x = arr.getJSONObject(i);
                 int camp = x.optInt("camp"), hero = x.optInt("heroid"), objid = x.optInt("objid");
@@ -84,13 +85,17 @@ public class MainActivity extends Activity {
                     if (e != null && e.length() >= 2 && e.optInt(0) != 0)
                         eq.append(e.optInt(0)).append('/').append(e.optInt(1)).append(' ');
                 }
+                String nm = x.optString("name", "?");
+                String vis = dead == 1 ? "死亡" : (lvis == 1 ? "可见" : "雾中");
+                String scr = cam == 1 ? "屏内" : "屏外";
+                boolean nativeOk = (mx != 0 || mz != 0);
                 sb.append(String.format(Locale.US,
-                        "%s %-4d %-4d %5d/%-5d %2d %6d %6s (%6.1f,%6.1f) (%6.1f,%6.1f) %d %d %d %s\n",
-                        camp == 1 ? "蓝" : (camp == 2 ? "红" : "?"), hero, objid,
-                        hp, hpmax, lvl, gold,
-                        d < 0 ? "-" : String.format(Locale.US, "%.1f", d),
-                        px / 100.0, pz / 100.0, mx / 100.0, mz / 100.0,
-                        lvis, cam, dead, eq));
+                        "%-9s %s %5s (%6.1f,%6.1f)%s %-3s %-3s %5d/%-5d %2d %6d %s\n",
+                        nm + "(" + hero + ")",
+                        camp == 1 ? "蓝" : (camp == 2 ? "红" : "?"),
+                        d < 0 ? "-" : String.format(Locale.US, "%.1fm", d),
+                        px / 100.0, pz / 100.0, nativeOk ? "" : "*",
+                        vis, scr, hp, hpmax, lvl, gold, eq));
 
                 JSONArray sk = x.optJSONArray("skills");
                 if (sk != null && sk.length() > 0) {
@@ -106,7 +111,7 @@ public class MainActivity extends Activity {
                     sb.append('\n');
                 }
             }
-            sb.append("\nV=逻辑可见 C=在相机内 D=死亡；技能 cd/cdmax，R=就绪，+=可升级");
+            sb.append("\n视野=逻辑可见(可见/雾中)  屏=在相机内(屏内/屏外)  *=原生缺失，用C#兜底");
         } catch (Exception e) {
             sb.append("解析失败: ").append(e);
         }

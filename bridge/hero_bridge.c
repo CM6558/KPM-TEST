@@ -17,6 +17,16 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <math.h>
+#include "heromap.h"
+
+/* 英雄 id -> 名字 (来自模块的 heromap.h) */
+static const char *hname(unsigned int id)
+{
+    unsigned int i;
+    for (i = 0; i < (unsigned int)(sizeof(g_heromap)/sizeof(g_heromap[0])); i++)
+        if (g_heromap[i].id == id) return g_heromap[i].name;
+    return "?";
+}
 
 /* ---------- 与模块一致的记录布局 (packed, 小端) ---------- */
 struct hb_eq { uint16_t id, cnt; } __attribute__((packed));
@@ -114,14 +124,14 @@ static int build_json(const volatile uint8_t *m) {
         px = (r->mx && r->mz) ? r->mx : r->x;
         pz = (r->mx && r->mz) ? r->mz : r->z;
         o += snprintf(g_json+o, sizeof(g_json)-o,
-            "%s{\"heroid\":%u,\"camp\":%u,\"objid\":%u,\"me\":%u,"
+            "%s{\"heroid\":%u,\"camp\":%u,\"objid\":%u,\"me\":%u,\"name\":\"%s\","
             "\"hp\":%d,\"hpmax\":%d,\"lvl\":%d,\"gold\":%d,"
             "\"x\":%d,\"y\":%d,\"z\":%d,\"move\":%d,\"fyaw\":%d,\"mx\":%d,\"mz\":%d,"
             "\"ad\":%d,\"def\":%d,\"res\":%d,"
             "\"dead\":%u,\"dying\":%u,\"grass\":%u,\"freeze\":%u,\"battle\":%u,"
             "\"nomove\":%u,\"inroom\":%u,\"fantasy\":%u,\"autoai\":%u,\"lvis\":%u,\"cam\":%u,"
             "\"atktarget\":%u,\"eqn\":%u,\"eq\":[",
-            i?" ,":"", r->heroid, r->camp, r->objid, r->me,
+            i?" ,":"", r->heroid, r->camp, r->objid, r->me, hname(r->heroid),
             r->hp, r->hpmax, r->lvl, r->gold, px, r->y, pz, r->move, fyaw, r->mx, r->mz,
             r->ad, r->def, r->res,
             r->dead, r->dying, r->grass, r->freeze, r->battle,
@@ -144,6 +154,7 @@ static int build_json(const volatile uint8_t *m) {
 }
 
 /* ---------- WebSocket 发送 ---------- */
+
 static int ws_send(int fd, const char *buf, int len) {
     uint8_t hdr[10]; int hl = 0, i;
     hdr[0] = 0x81; /* FIN + text */
