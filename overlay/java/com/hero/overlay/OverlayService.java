@@ -21,6 +21,7 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import org.json.JSONArray;
+import java.util.ArrayList;
 import org.json.JSONObject;
 
 import java.io.InputStream;
@@ -56,7 +57,7 @@ public class OverlayService extends Service {
 
     private WindowManager wm;
     private FrameLayout box;
-    private ArrowView arrow;
+    private RadarView radar;
     private TextView info;
     private WindowManager.LayoutParams lp;
     private float downX, downY; private int startX, startY;
@@ -74,14 +75,14 @@ public class OverlayService extends Service {
         wm = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
 
         float dens = getResources().getDisplayMetrics().density;
-        int sz = (int) (62 * dens);
+        int sz = (int) (170 * dens);   /* 雷达图直径 */
 
         box = new FrameLayout(this);
         box.setBackgroundColor(Color.TRANSPARENT);
         box.setPadding(0, 0, 0, 0);
 
-        arrow = new ArrowView(this);
-        box.addView(arrow, new FrameLayout.LayoutParams(sz, sz));
+        radar = new RadarView(this);
+        box.addView(radar, new FrameLayout.LayoutParams(sz, sz));
 
         info = new TextView(this);
         info.setTextColor(Color.parseColor("#39FF14"));
@@ -264,15 +265,31 @@ public class OverlayService extends Service {
             arrowCh = new String[]{"→", "↗", "↑", "↖", "←", "↙", "↓", "↘"}[k];
             dir = String.format(Locale.US, "%s%3d°", arrowCh, (int) Math.round(deg) % 360);
         }
-        /* 浮窗只画箭头: 把精确角度交给 ArrowView */
-        { final float fdeg = (degAll < 0) ? -1f : (float) degAll;
-          final String itxt = haveMe
+        /* 雷达: 所有人（含队友）的位置，红点+名字；我=绿点 */
+        if (haveMe) {
+            ArrayList<RadarView.Item> list = new ArrayList<>();
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject h = arr.getJSONObject(i);
+                int hx = h.optInt("x"), hz = h.optInt("z");
+                if (Math.abs(hx) > 50000 || Math.abs(hz) > 50000) continue;
+                double dx = hx - myX, dz = hz - myZ;
+                double uu = dx * ux + dz * uz;
+                double vv = dx * rx + dz * rz;
+                boolean me = h.optInt("me") == 1;
+                boolean enemy = h.getInt("camp") != myCamp;
+                boolean dead = h.optInt("dead") == 1;
+                boolean vis = h.optInt("lvis") == 1;
+                list.add(new RadarView.Item(h.optString("name", "?"), (float) uu, (float) vv,
+                        enemy, me, dead, vis));
+            }
+            radar.setData(list, 4000f);   /* 半径 40m */
+        }
+        { final String itxt = haveMe
                   ? (nearest == Double.MAX_VALUE
                         ? String.format(Locale.US, "%d \u00b7 --", near)
                         : String.format(Locale.US, "%d|%s %.1fm", near, nname, nearest / 100.0))
                   : "--";
-          box.post(() -> { if (arrow != null) arrow.setAngle(fdeg);
-                           if (info != null) info.setText(itxt); }); }
+          box.post(() -> { if (info != null) info.setText(itxt); }); }
         String line1 = haveMe ? String.format(Locale.US, "%2d·%5.1fm %s", near,
                                 nearest == Double.MAX_VALUE ? 0.0 : nearest / 100.0, dir)
                               : "no-me";

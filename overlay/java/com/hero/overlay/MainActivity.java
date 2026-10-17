@@ -76,8 +76,8 @@ public class MainActivity extends Activity {
                 int mx = x.optInt("mx"), mz = x.optInt("mz");
                 int lvis = x.optInt("lvis"), cam = x.optInt("cam"), dead = x.optInt("dead");
                 boolean enemy = haveMe && camp != meCamp;
-                /* 绝对距离：所有英雄都算（不再只算敌人） */
-                double d = haveMe ? Math.hypot(px - meX, pz - meZ) / 100.0 : -1;
+                /* 距离只算敌人（队友不显示） */
+                double d = (enemy && haveMe) ? Math.hypot(px - meX, pz - meZ) / 100.0 : -1;
 
                 StringBuilder eq = new StringBuilder();
                 JSONArray eqa = x.optJSONArray("eq");
