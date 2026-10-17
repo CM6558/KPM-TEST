@@ -10,7 +10,7 @@ import android.view.View;
 import java.util.ArrayList;
 
 /** 全图浮窗：固定地图坐标系（不跟随我），红点=人，绿点=我，带名字。
- *  阵营1（蓝，左下）：x→右, z→上；阵营2（红，右上）：旋转 180°。 */
+ *  直接按原始坐标渲染：x→右, z→上（不旋转、不按阵营翻转）。 */
 public class RadarView extends View {
     public static class Item {
         public String name;
@@ -67,9 +67,9 @@ public class RadarView extends View {
             float fx = it.x / halfCm, fz = it.z / halfCm;      /* -1..1 */
             if (fx > 1f) fx = 1f; if (fx < -1f) fx = -1f;
             if (fz > 1f) fz = 1f; if (fz < -1f) fz = -1f;
-            float px, py;
-            if (myCamp == 2) { px = cx - fx * half * 0.94f; py = cy + fz * half * 0.94f; }
-            else             { px = cx + fx * half * 0.94f; py = cy - fz * half * 0.94f; }
+            /* 不做任何旋转/翻转：直接按原始坐标渲染 (x→右, z→上) */
+            float px = cx + fx * half * 0.94f;
+            float py = cy - fz * half * 0.94f;
 
             if (it.me) dot.setColor(0xFF39FF14);
             else if (it.dead) dot.setColor(0xFF777777);

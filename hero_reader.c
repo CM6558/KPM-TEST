@@ -3358,8 +3358,10 @@ have_inst:
             int n = snprintf(line, sizeof(line), "{\"_doc\":%s,\"seq\":%lu,\"n\":%lu,\"heroes\":[\n", g_hero_doc, g_hero_seq++, cnt);
             p_kernel_write(f, line, (unsigned long)n, &pos);
         } else if (g_verbose) {
-            if (!g_in_match) { g_in_match = 1; pr_info("[hero-reader] 对局开始 heroes=%u\n", cnt); }
+            pr_info("[hero-reader] heroes json 关闭, 仅写 bin\n");
         }
+        /* 对局状态: 与 verbose/输出方式无关 */
+        if (!g_in_match) { g_in_match = 1; pr_info("[hero-reader] 对局开始 heroes=%u\n", cnt); }
 
         { int nn = nat_collect(nrt, NAT_MAX); if (g_verbose) pr_info("[hero-reader] native 表: roster=0x%lx n=%d\n", g_nat_roster, nn); nrn = nn; }
         {   /* 标定用: 先找本机 actor 的位置 */
