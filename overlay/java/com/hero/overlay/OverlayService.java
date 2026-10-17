@@ -221,6 +221,7 @@ public class OverlayService extends Service {
         int near = 0;
         double nearest = Double.MAX_VALUE, ndx = 0, ndz = 0;
         int nlvis = -1, nhero = 0;
+        String nname = "?";
         /* 箭头目标 = 最近敌人（不看视野）。原生坐标是雾中真值，
          * 敌人刚消失也要继续指向它，而不是切到下一个可见敌人。 */
         /* 屏幕基向量 (世界坐标, 单位向量): up=屏幕上, right=屏幕右 */
@@ -241,7 +242,10 @@ public class OverlayService extends Service {
                 double u = dx * ux + dz * uz;
                 double v = dx * rx + dz * rz;
                 if (Math.abs(v) <= CAM_HALF_W && u <= CAM_FRONT && u >= -CAM_BACK) near++;
-                if (d < nearest) { nearest = d; ndx = dx; ndz = dz; nlvis = h.optInt("lvis"); nhero = h.getInt("heroid"); }
+                if (d < nearest) {
+                    nearest = d; ndx = dx; ndz = dz; nlvis = h.optInt("lvis"); nhero = h.getInt("heroid");
+                    nname = h.optString("name", "?");
+                }
 
             }
         }
@@ -263,8 +267,9 @@ public class OverlayService extends Service {
         /* 浮窗只画箭头: 把精确角度交给 ArrowView */
         { final float fdeg = (degAll < 0) ? -1f : (float) degAll;
           final String itxt = haveMe
-                  ? String.format(Locale.US, "%d \u00b7 %.1fm", near,
-                                  nearest == Double.MAX_VALUE ? 0.0 : nearest / 100.0)
+                  ? (nearest == Double.MAX_VALUE
+                        ? String.format(Locale.US, "%d \u00b7 --", near)
+                        : String.format(Locale.US, "%d|%s %.1fm", near, nname, nearest / 100.0))
                   : "--";
           box.post(() -> { if (arrow != null) arrow.setAngle(fdeg);
                            if (info != null) info.setText(itxt); }); }
