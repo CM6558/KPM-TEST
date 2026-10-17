@@ -148,7 +148,7 @@ static unsigned long  g_ptc_va[64], g_ptc_pa[64];
 static long long (*p_ktime_get_ns)(void);   /* 指向 ktime_get (返回 ns) */
 static unsigned int   g_pf_cycles = 0, g_pf_scans = 0;
 static int            g_in_match = 0;
-static int            g_nat_gate = 1;   /* 1=可见时用 C# 校验原生坐标; 0=完全信任原生 */          /* 局内/局外状态, 用于降频与日志限流 */
+static int            g_nat_gate = 0;   /* 1=可见时用 C# 校验原生坐标; 0=完全信任原生 */          /* 局内/局外状态, 用于降频与日志限流 */
 static unsigned long long g_pf_total_us = 0, g_pf_max_us = 0;
 static unsigned int   g_pf_slow = 0;
 static unsigned int   g_bin_no_native = 0, g_bin_mm_fallback = 0, g_bin_bad_native = 0;                       /* >3ms 的轮数 */
@@ -2932,9 +2932,8 @@ static void do_natx2(void)
             __builtin_memcpy(&fy2, &y2, 4);
             __builtin_memcpy(&fz2, &z2, 4);
         }
-        pr_info("[hero-reader] natx2 hero=%u camp=%u lvis=%d C#=(%d,%d) | link=(%d,%d) | p2=(%d,%d,%d) f=(%d,%d,%d)\n",
-                hero, camp, lv, cx, cz, x1, z1, x2, y2, z2,
-                (int)(fx2 * 100), (int)(fy2 * 100), (int)(fz2 * 100));
+        pr_info("[hero-reader] natx2 hero=%u camp=%u lvis=%d C#=(%d,%d) | link=(%d,%d) | p2addr=0x%lx p2=(%d,%d,%d)\n",
+                hero, camp, lv, cx, cz, x1, z1, p2, x2, y2, z2);
     }
     pr_info("[hero-reader] natx2: 结束\n");
 }
