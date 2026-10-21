@@ -2095,8 +2095,11 @@ static int read_rootactor_chain(void)
 
         get_actor_coords(hero_ptr, &real_x, &real_y, &real_z);
 
-        pr_info("[hero-reader]   [#%02d] slot=%d hero=0x%lx cfg=%d camp=%u rt=%d pos=(%d,%d) cm en=%u st=%u grass=%u\n",
-                valid, slot, hero_ptr, config_id, camp_raw, runtime_id, real_x, real_z, enabled_flag, state_code, is_in_grass);
+        /* 存活判定: enabled_flag 正常>=1 且 state_code!=1 (死亡态) */
+        int is_dead = (enabled_flag < 1 || state_code == 1);
+
+        pr_info("[hero-reader]   [#%02d] slot=%d hero=0x%lx cfg=%d camp=%u rt=%d pos=(%d,%d) cm en=%u st=%u dead=%d\n",
+                valid, slot, hero_ptr, config_id, camp_raw, runtime_id, real_x, real_z, enabled_flag, state_code, is_dead);
 
         rb = &g_bin_rec[valid];
         rb->heroid = (uint32_t)config_id;
@@ -2106,7 +2109,7 @@ static int read_rootactor_chain(void)
         rb->z = real_z;
         rb->mx = real_x;
         rb->mz = real_z;
-        rb->dead = 0;   /* 对局英雄默认标记存活 */
+        rb->dead = (uint8_t)is_dead;
         rb->grass = is_in_grass;
 
         /* 阵营判定: 优先信任官方字段 camp_raw (+0x34) */

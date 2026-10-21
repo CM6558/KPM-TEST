@@ -50,10 +50,9 @@ public class OverlayService extends Service {
      * 阵营1(左下): 屏幕上方 = 世界 45°  (即 (+x,+z) 对角)
      * 阵营2(右上): 屏幕上方 = 世界 225° (地图视角旋转 180°)
      * 标定常量是在阵营1的屏幕基下得到的; 阵营2 用同一矩形, 基向量旋转 180°。 */
-    /* 屏幕基角度（阵营1）。长按悬浮窗每次 +45°，实时校准并持久化。
-     * 阵营2 = 基准 + 180°（地图视角旋转 180°）。 */
-    private int upDegBase = 45;
-    private double upDegOf(int camp) { return (upDegBase + (camp == 2 ? 180 : 0)) % 360; }
+    /* 屏幕基角度（阵营1: 45°对角基准; 阵营2: 225°） */
+    private static final int BASE_UP_DEG = 45;
+    private double upDegOf(int camp) { return (BASE_UP_DEG + (camp == 2 ? 180 : 0)) % 360; }
 
     private WindowManager wm;
     private FrameLayout box;
@@ -109,7 +108,6 @@ public class OverlayService extends Service {
                 PixelFormat.TRANSLUCENT);
         lp.gravity = Gravity.TOP | Gravity.START; lp.x = 60; lp.y = 220;
 
-        upDegBase = getSharedPreferences("hero", MODE_PRIVATE).getInt("updeg", 45);
         box.setOnTouchListener((v, e) -> {
             switch (e.getActionMasked()) {
                 case MotionEvent.ACTION_DOWN:
@@ -125,13 +123,6 @@ public class OverlayService extends Service {
                     return true;
                 case MotionEvent.ACTION_UP:
                 case MotionEvent.ACTION_CANCEL:
-                    /* 长按 (>0.7s) 且没拖动 -> 方向基准 +45° */
-                    if (!moved && System.currentTimeMillis() - downTime > 700) {
-                        upDegBase = (upDegBase + 45) % 360;
-                        getSharedPreferences("hero", MODE_PRIVATE).edit().putInt("updeg", upDegBase).apply();
-                        Toast.makeText(this, "方向基准 " + upDegBase + "°（阵营1）",
-                                Toast.LENGTH_SHORT).show();
-                    }
                     return true;
             }
             return false;
