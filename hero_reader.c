@@ -1969,21 +1969,9 @@ static int get_actor_coords(unsigned long actor, int *ox, int *oy, int *oz)
     unsigned long node = 0, link = 0, tr = 0, p2 = 0;
     int xx = 0, yy = 0, zz = 0;
 
-    /* 路径 1: ViewManager 内部核心逻辑槽 (Actor + 0x20 / + 0x28, 单位: 厘米)
-     * 该槽位是服务端距离判定直读项 (0x24AD910: add x28, x21, #0x20; ldr x8, [x8, #0x388])，
-     * 不受迷雾 55000 混淆改写。若有效则优先采用。 */
-    rm(&xx, actor + 0x20UL, 4);
-    rm(&zz, actor + 0x28UL, 4);
-    if ((xx != 0 || zz != 0) && (xx > -45000 && xx < 45000) && (zz > -45000 && zz < 45000)) {
-        *ox = xx;
-        *oy = 0;
-        *oz = zz;
-        return 1;
-    }
-
-    /* 路径 2: 权威物理变换链 Transform (帧同步模拟层)
-     * 需防御 ViewManager 视野混淆篡改: 迷雾/草丛隐身状态下会将坐标强行置为 ±55000 或基准出生点 (±55m~60m)。
-     * 若落在正常对局活动范围 (±48m) 内，则作为高频运动平滑补偿。 */
+    /* 路径 1: 权威物理变换链 Transform (帧同步模拟层真实世界坐标)
+     * 单位: 毫米 (mm)，转换给上层使用时转为厘米 (/10)。
+     * 地图边界约为 ±60000 毫米 (±60米)。 */
     if (rm(&node, actor + 0xA8UL, 8)) {
         node = untag(node);
         if (node > 0x100000000UL && node < 0x800000000000UL) {
@@ -1999,14 +1987,11 @@ static int get_actor_coords(unsigned long actor, int *ox, int *oy, int *oz)
                                     rm(&xx, p2 + 0, 4);
                                     rm(&yy, p2 + 4, 4);
                                     rm(&zz, p2 + 8, 4);
-                                    int cm_x = xx / 10;
-                                    int cm_z = zz / 10;
-                                    /* 防御迷雾混淆: 过滤 ViewManager 注入的 55000 哨兵值 */
-                                    if ((cm_x != 0 || cm_z != 0) && (cm_x > -48000 && cm_x < 48000) && (cm_z > -48000 && cm_z < 48000)) {
-                                        *ox = cm_x;
+                                    if (xx != 0 || zz != 0) {
+                                        *ox = xx / 10;   /* 毫米转厘米 */
                                         *oy = yy / 10;
-                                        *oz = cm_z;
-                                        return 2;
+                                        *oz = zz / 10;
+                                        return 1;
                                     }
                                 }
                             }
@@ -2017,13 +2002,13 @@ static int get_actor_coords(unsigned long actor, int *ox, int *oy, int *oz)
         }
     }
 
-    /* 路径 3: 结构体直读 +32 / +40 / +44 (出生点/初始基准兜底) */
+    /* 路径 2: 结构体直读 +32 / +40 / +44 (兜底) */
     rm(&xx, actor + 32UL, 4);
     rm(&yy, actor + 40UL, 4);
     rm(&zz, actor + 44UL, 2);
-    if ((xx != 0 || zz != 0) && (xx > -52000 && xx < 52000) && (zz > -52000 && zz < 52000)) {
+    if (xx != 0 || zz != 0) {
         *ox = xx; *oy = yy; *oz = (int)zz;
-        return 3;
+        return 2;
     }
     return 0;
 }
