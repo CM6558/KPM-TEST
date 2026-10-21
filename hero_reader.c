@@ -2138,6 +2138,299 @@ static int read_rootactor_chain(void)
     return (int)valid;
 }
 
+/* ============================================================ 文件重定向 dump (不依赖 dmesg)
+ * herostat <path>   — 写英雄摘要到文件 (count / cfg / camp / pos / dead)
+ * dumpphase <tag> <path> — 写所有英雄完整 1008 字节 + Transform 链到文件
+ * 全部同步执行, 直接写文件, 脚本零 dmesg 依赖
+ */
+
+/* 内部: 打开文件 (override_creds) */
+static void *hr_file_open(const char *path, void **old_cred)
+{
+    void *f;
+    *old_cred = NULL;
+    if (!p_filp_open || !p_kernel_write || !p_filp_close) return NULL;
+    if (g_io_cred && p_override_creds) *old_cred = p_override_creds(g_io_cred);
+    f = p_filp_open(path, KPM_O_WRONLY | KPM_O_CREAT | KPM_O_TRUNC, 0644);
+    if (!f || (unsigned long)f >= (unsigned long)-4095UL) {
+        if (*old_cred && p_revert_creds) p_revert_creds(*old_cred);
+        *old_cred = NULL;
+        return NULL;
+    }
+    return f;
+}
+
+static void hr_file_close(void *f, void *old_cred)
+{
+    if (f && p_filp_close) p_filp_close(f, NULL);
+    if (old_cred && p_revert_creds) p_revert_creds(old_cred);
+}
+
+/* 内部: 遍历 rootactor 链, 对每个有效英雄调用回调 */
+typedef int (*hr_hero_cb)(void *ud, unsigned long hero_ptr, int config_id,
+                          int runtime_id, unsigned int camp_raw,
+                          unsigned int enabled_flag, unsigned int state_code,
+                          unsigned char is_in_grass, int slot, int index);
+
+static int hr_walk_heroes(hr_hero_cb cb, void *ud)
+{
+    unsigned long b = 0, p_root_slot = 0, game_root = 0, actor_mgr = 0;
+    unsigned long pool_base = 0, index_buf = 0;
+    unsigned int flag = 0, count = 0, valid = 0;
+    unsigned long count_off = 0;
+    int i, ret = 0;
+
+    if (!g_target_mm) return -1;
+    b = gc_base();
+    if (!b) return -2;
+
+    if (!rm(&p_root_slot, b + 0x51EA4D0UL, 8)) return -3;
+    p_root_slot = untag(p_root_slot);
+    if (!p_root_slot || p_root_slot < 0x100000000UL) return -4;
+
+    if (!rm(&game_root, p_root_slot, 8)) return -5;
+    game_root = untag(game_root);
+    if (!game_root || game_root < 0x100000000UL) return -6;
+
+    if (!rm(&actor_mgr, game_root + 0x388UL, 8)) return -7;
+    actor_mgr = untag(actor_mgr);
+    if (!actor_mgr || actor_mgr < 0x100000000UL) return -8;
+
+    rm(&flag, actor_mgr + 0x2EB0UL, 4);
+    count_off = (flag == 0) ? 0x2E8CUL : 0x2EACUL;
+    rm(&count, actor_mgr + count_off, 4);
+    if (count == 0 || count > 512) return -9;
+
+    rm(&index_buf, actor_mgr + 0x2E90UL, 8);
+    if (!rm(&pool_base, actor_mgr + 0x2E70UL, 8)) return -10;
+    index_buf = untag(index_buf);
+    pool_base = untag(pool_base);
+    if (!pool_base || pool_base < 0x100000000UL) return -11;
+
+    for (i = 0; i < (int)count && valid < HB_MAXREC; i++) {
+        int rel_idx = 0, slot = 0;
+        unsigned long entry_addr = 0, hero_ptr = 0;
+        int config_id = 0, runtime_id = 0;
+        unsigned int enabled_flag = 0, state_code = 0, camp_raw = 0;
+        unsigned char is_in_grass = 0;
+        int r;
+
+        if (flag == 0 || !index_buf) {
+            slot = i;
+        } else {
+            if (!rm(&rel_idx, index_buf + (unsigned long)i * 4, 4)) continue;
+            slot = rel_idx + i;
+        }
+        if (slot < 0 || slot >= 512) continue;
+
+        entry_addr = pool_base + (unsigned long)slot * 32UL;
+        if (!rm(&hero_ptr, entry_addr + 8UL, 8)) continue;
+        hero_ptr = untag(hero_ptr);
+        if (!hero_ptr || hero_ptr < 0x100000000UL || hero_ptr >= 0x800000000000UL) continue;
+
+        rm(&runtime_id, hero_ptr + 8UL, 4);
+        rm(&config_id, hero_ptr + 0x28UL, 4);
+        rm(&camp_raw, hero_ptr + 0x34UL, 4);
+        rm(&enabled_flag, hero_ptr + 88UL, 4);
+        rm(&state_code, hero_ptr + 92UL, 4);
+        rm(&is_in_grass, hero_ptr + 712UL, 1);
+
+        if (config_id < 100 || config_id > 700) continue;
+
+        r = cb(ud, hero_ptr, config_id, runtime_id, camp_raw,
+               enabled_flag, state_code, is_in_grass, slot, valid);
+        if (r < 0) return r;
+        valid++;
+    }
+    ret = (int)valid;
+    return ret;
+}
+
+/* --- herostat: 写摘要到文件 --- */
+struct hr_stat_ctx { void *f; long long pos; int err; };
+
+static int hr_stat_cb(void *ud, unsigned long hero_ptr, int config_id,
+                      int runtime_id, unsigned int camp_raw,
+                      unsigned int enabled_flag, unsigned int state_code,
+                      unsigned char is_in_grass, int slot, int index)
+{
+    struct hr_stat_ctx *ctx = (struct hr_stat_ctx *)ud;
+    unsigned long node = 0, link = 0, tr = 0, p2 = 0;
+    int xx = 0, yy = 0, zz = 0;
+    char line[200];
+    int n;
+    int is_dead = (enabled_flag < 1 || state_code == 1);
+
+    /* Transform 坐标 */
+    if (rm(&node, hero_ptr + 0xA8UL, 8)) {
+        node = untag(node);
+        if (node > 0x100000000UL && node < 0x800000000000UL) {
+            if (rm(&link, node + 0x10UL, 8)) {
+                link = untag(link);
+                if (link > 0x100000000UL && link < 0x800000000000UL) {
+                    if (rm(&tr, link + 0x00UL, 8)) {
+                        tr = untag(tr);
+                        if (tr > 0x100000000UL && tr < 0x800000000000UL) {
+                            if (rm(&p2, tr + 0x60UL, 8)) {
+                                p2 = untag(p2);
+                                if (p2 > 0x100000000UL && p2 < 0x800000000000UL) {
+                                    rm(&xx, p2 + 0, 4);
+                                    rm(&yy, p2 + 4, 4);
+                                    rm(&zz, p2 + 8, 4);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    n = snprintf(line, sizeof(line),
+        "hero[%d] ptr=0x%lx cfg=%d camp=%u rt=%d pos=(%d,%d) mm=(%d,%d,%d) dead=%d grass=%u slot=%d\n",
+        index, hero_ptr, config_id, camp_raw, runtime_id,
+        xx / 10, zz / 10, xx, yy, zz, is_dead, is_in_grass, slot);
+    if (p_kernel_write(ctx->f, line, n, &ctx->pos) < 0) { ctx->err = 1; return -1; }
+    return 0;
+}
+
+/* --- dumpphase: 完整 dump 到文件 --- */
+struct hr_dump_ctx { void *f; long long pos; int err; };
+
+static int hr_dump_hero_cb(void *ud, unsigned long hero_ptr, int config_id,
+                           int runtime_id, unsigned int camp_raw,
+                           unsigned int enabled_flag, unsigned int state_code,
+                           unsigned char is_in_grass, int slot, int index)
+{
+    struct hr_dump_ctx *ctx = (struct hr_dump_ctx *)ud;
+    char line[160];
+    int n, w, k;
+    int is_dead = (enabled_flag < 1 || state_code == 1);
+
+    /* 头 */
+    n = snprintf(line, sizeof(line),
+        "\n=== Hero[%d] ptr=0x%lx cfg=%d camp=%u rt=%d dead=%d grass=%u slot=%d ===\n",
+        index, hero_ptr, config_id, camp_raw, runtime_id, is_dead, is_in_grass, slot);
+    p_kernel_write(ctx->f, line, n, &ctx->pos);
+
+    /* Hero 本体 252 words (1008 bytes), 每行 4 words */
+    n = snprintf(line, sizeof(line), "--- [HERO] 252 words ---\n");
+    p_kernel_write(ctx->f, line, n, &ctx->pos);
+    for (w = 0; w < 252; w += 4) {
+        unsigned int v[4] = {0, 0, 0, 0};
+        for (k = 0; k < 4 && w + k < 252; k++)
+            rm(&v[k], hero_ptr + (unsigned long)(w + k) * 4, 4);
+        n = snprintf(line, sizeof(line), "+0x%04x: %08x %08x %08x %08x\n",
+                     w * 4, v[0], v[1], v[2], v[3]);
+        p_kernel_write(ctx->f, line, n, &ctx->pos);
+    }
+
+    /* Transform 链 */
+    {
+        unsigned long node = 0, link = 0, tr = 0, p2 = 0;
+        n = snprintf(line, sizeof(line), "--- [TRANSFORM] chain ---\n");
+        p_kernel_write(ctx->f, line, n, &ctx->pos);
+
+        rm(&node, hero_ptr + 0xA8UL, 8);
+        node = untag(node);
+        n = snprintf(line, sizeof(line), "Node = 0x%lx\n", node);
+        p_kernel_write(ctx->f, line, n, &ctx->pos);
+        if (node > 0x100000000UL && node < 0x800000000000UL) {
+            /* Node 32 words */
+            for (w = 0; w < 32; w += 4) {
+                unsigned int v[4] = {0, 0, 0, 0};
+                for (k = 0; k < 4 && w + k < 32; k++)
+                    rm(&v[k], node + (unsigned long)(w + k) * 4, 4);
+                n = snprintf(line, sizeof(line), "  node+0x%03x: %08x %08x %08x %08x\n",
+                             w * 4, v[0], v[1], v[2], v[3]);
+                p_kernel_write(ctx->f, line, n, &ctx->pos);
+            }
+            rm(&link, node + 0x10UL, 8);
+            link = untag(link);
+            n = snprintf(line, sizeof(line), "Link = 0x%lx\n", link);
+            p_kernel_write(ctx->f, line, n, &ctx->pos);
+            if (link > 0x100000000UL && link < 0x800000000000UL) {
+                /* Link 32 words */
+                for (w = 0; w < 32; w += 4) {
+                    unsigned int v[4] = {0, 0, 0, 0};
+                    for (k = 0; k < 4 && w + k < 32; k++)
+                        rm(&v[k], link + (unsigned long)(w + k) * 4, 4);
+                    n = snprintf(line, sizeof(line), "  link+0x%03x: %08x %08x %08x %08x\n",
+                                 w * 4, v[0], v[1], v[2], v[3]);
+                    p_kernel_write(ctx->f, line, n, &ctx->pos);
+                }
+                rm(&tr, link + 0x00UL, 8);
+                tr = untag(tr);
+                n = snprintf(line, sizeof(line), "Transform = 0x%lx\n", tr);
+                p_kernel_write(ctx->f, line, n, &ctx->pos);
+                if (tr > 0x100000000UL && tr < 0x800000000000UL) {
+                    rm(&p2, tr + 0x60UL, 8);
+                    p2 = untag(p2);
+                    n = snprintf(line, sizeof(line), "VInt3 = 0x%lx\n", p2);
+                    p_kernel_write(ctx->f, line, n, &ctx->pos);
+                    if (p2 > 0x100000000UL && p2 < 0x800000000000UL) {
+                        unsigned int vx = 0, vy = 0, vz = 0;
+                        rm(&vx, p2 + 0, 4);
+                        rm(&vy, p2 + 4, 4);
+                        rm(&vz, p2 + 8, 4);
+                        n = snprintf(line, sizeof(line), "  VInt3: x=%d y=%d z=%d (mm) cm=(%d,%d,%d)\n",
+                                     vx, vy, vz, vx / 10, vy / 10, vz / 10);
+                        p_kernel_write(ctx->f, line, n, &ctx->pos);
+                    }
+                }
+            }
+        }
+    }
+
+    n = snprintf(line, sizeof(line), "--- End Hero[%d] ---\n", index);
+    p_kernel_write(ctx->f, line, n, &ctx->pos);
+    return 0;
+}
+
+/* --- ctl0: herostat <path> --- */
+static int do_herostat(const char *path)
+{
+    struct hr_stat_ctx ctx;
+    void *f, *old_cred;
+    char line[80];
+    int n, count;
+
+    if (!g_target_mm) return -1;
+    f = hr_file_open(path, &old_cred);
+    if (!f) return -2;
+    ctx.f = f; ctx.pos = 0; ctx.err = 0;
+    count = hr_walk_heroes(hr_stat_cb, &ctx);
+    n = snprintf(line, sizeof(line), "count=%d\n", count > 0 ? count : 0);
+    p_kernel_write(f, line, n, &ctx.pos);
+    hr_file_close(f, old_cred);
+    return count;
+}
+
+/* --- ctl0: dumpphase <tag> <path> --- */
+static int do_dumpphase(const char *tag, const char *path)
+{
+    struct hr_dump_ctx ctx;
+    void *f, *old_cred;
+    char line[160];
+    int n, count;
+
+    if (!g_target_mm) return -1;
+    f = hr_file_open(path, &old_cred);
+    if (!f) return -2;
+    ctx.f = f; ctx.pos = 0; ctx.err = 0;
+
+    n = snprintf(line, sizeof(line), "=== %s dump %s ===\n", tag, path);
+    p_kernel_write(f, line, n, &ctx.pos);
+
+    count = hr_walk_heroes(hr_dump_hero_cb, &ctx);
+
+    n = snprintf(line, sizeof(line), "\n=== total=%d heroes ===\n", count > 0 ? count : 0);
+    p_kernel_write(f, line, n, &ctx.pos);
+
+    hr_file_close(f, old_cred);
+    return count;
+}
+
 /* ============================================================ 诊断 (全部有界) */
 static void do_walk(int maxprint)
 {
@@ -2726,6 +3019,35 @@ static long hero_ctl0(const char *args, char *__user out_msg, int outlen)
         snprintf(resp, sizeof(resp), "chain: 历史 UnitLabel 链已废弃 (详见注释)，请用 fullchain/heroes/gameworld");
     } else if (!strcmp(args, "gw") || !strcmp(args, "gameworld")) {
         snprintf(resp, sizeof(resp), "gameworld: 链路已下线并转为注释备查");
+    } else if (!strncmp(args, "herostat ", 9)) {
+        const char *p = args + 9; char path[160]; int l = 0, v;
+        while (*p == ' ') p++;
+        while (*p && l < (int)sizeof(path) - 1) path[l++] = *p++;
+        path[l] = 0;
+        if (!path[0]) {
+            snprintf(resp, sizeof(resp), "herostat: 'herostat <path>'");
+        } else {
+            v = do_herostat(path);
+            if (v >= 0) snprintf(resp, sizeof(resp), "herostat: %d heroes -> %s", v, path);
+            else snprintf(resp, sizeof(resp), "herostat: 失败 rc=%d", v);
+        }
+    } else if (!strncmp(args, "dumpphase ", 10)) {
+        const char *p = args + 10; char tag[32], path[160]; int l = 0, v;
+        while (*p == ' ') p++;
+        l = 0;
+        while (*p && *p != ' ' && l < (int)sizeof(tag) - 1) tag[l++] = *p++;
+        tag[l] = 0;
+        while (*p == ' ') p++;
+        l = 0;
+        while (*p && l < (int)sizeof(path) - 1) path[l++] = *p++;
+        path[l] = 0;
+        if (!tag[0] || !path[0]) {
+            snprintf(resp, sizeof(resp), "dumpphase: 'dumpphase <tag> <path>'");
+        } else {
+            v = do_dumpphase(tag, path);
+            if (v >= 0) snprintf(resp, sizeof(resp), "dumpphase %s: %d heroes -> %s", tag, v, path);
+            else snprintf(resp, sizeof(resp), "dumpphase %s: 失败 rc=%d", tag, v);
+        }
     } else if (!strncmp(args, "peek ", 5)) {
         const char *p = args + 5; unsigned long a = 0; long cnt = 0;
         if (parse_hex(p, &a) && a) {
