@@ -359,11 +359,33 @@ static int gcb_cb(void *ud, unsigned long start, unsigned long end, unsigned lon
 static unsigned long gc_base(void)
 {
     struct gcb g;
-    if (g_gc_base) return g_gc_base;
+    static unsigned int gc_frames = 0;
+
+    /* ★ 根因 #3 修复: 每 30 帧重新校验 base 有效性 */
+    gc_frames++;
+    if (g_gc_base && gc_frames < 30) return g_gc_base;
+
+    /* 超 30 帧或未初始化 — 校验现有 base 是否仍有效 */
+    if (g_gc_base) {
+        unsigned long slot = 0;
+        if (rm(&slot, g_gc_base + 0x51EA4D0UL, 8)) {
+            slot = untag(slot);
+            if (slot > 0x100000000UL && slot < 0x800000000000UL) {
+                /* GOT 仍指向合法对象, base 仍有效 */
+                gc_frames = 0;
+                return g_gc_base;
+            }
+        }
+        /* base 失效, 重定位 */
+        g_gc_base = 0;
+    }
+
+    /* 重新 VMA 扫定位 */
     g.base = 0; g.found = 0;
     vma_walk(gcb_cb, &g);
     if (!g.found) return 0;
     g_gc_base = g.base;
+    gc_frames = 0;
     return g_gc_base;
 }
 
@@ -549,6 +571,24 @@ static int read_rootactor_chain(void)
         rm(&enabled_flag, hero_ptr + 88UL, 4);
         rm(&state_code, hero_ptr + 92UL, 4);
         rm(&is_in_grass, hero_ptr + 712UL, 1);
+
+        /* ★ 根因 #4 修复: IndexBuffer seqlock 校验
+         * 读完 Hero 后, 重读 flag + IndexBuffer[i] 比对一致性
+         * 若容器结构在读取过程中被改 → 跳过这一帧 */
+        {
+            unsigned int flag2 = 0;
+            unsigned long index_buf2 = 0;
+            rm(&flag2, actor_mgr + 0x2EB0UL, 4);
+            rm(&index_buf2, actor_mgr + 0x2E90UL, 8);
+            index_buf2 = untag(index_buf2);
+            if (flag2 != flag || index_buf2 != index_buf) continue;
+            /* IndexBuffer 内容也校验 (重读 IndexBuffer[i] 比对 slot) */
+            if (flag != 0 && index_buf) {
+                int rel_idx2 = 0;
+                rm(&rel_idx2, index_buf + (unsigned long)i * 4, 4);
+                if (rel_idx2 != rel_idx) continue;
+            }
+        }
 
         /* 过滤：王者荣耀英雄ID通常在 100~700 之间 (如105廉颇..585元流之子) */
         if (config_id < 100 || config_id > 700) continue;
