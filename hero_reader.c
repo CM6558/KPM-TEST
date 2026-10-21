@@ -2140,6 +2140,271 @@ static int read_rootactor_chain(void)
     return (int)valid;
 }
 
+/* ============================================================ findposarray — 搜索真实位置数组
+ * 在游戏堆中搜索 ViewManager 使用的英雄位置数组:
+ *   连续 10 个 entry, 步长 0x3F0 (1008 bytes)
+ *   entry+0x04 = config_id (100~700)
+ *   entry+0x20 = x 坐标 (int32, 非0, ±60000)
+ *   entry+0x24 = y 坐标 (int32)
+ *   entry+0x28 = z 坐标 (int32, 非0, ±60000)
+ *   entry+0x358 = is_in_grass (byte, 0/1)
+ * 找到后输出 base 地址, 后续直接读 entry+0x20 即为真实坐标
+ */
+
+struct fpa_ctx {
+    unsigned long found_base;
+    int found;
+    int scanned;
+    /* 用于校验的 config_id 集合 */
+    int ref_cfg[10];
+    int ref_n;
+    int ref_valid;
+};
+
+/* 从 CActorManager 获取当前对局的 config_id 列表 (用于交叉校验) */
+static void fpa_get_ref_cfgs(struct fpa_ctx *ctx)
+{
+    unsigned long b = 0, p_root_slot = 0, game_root = 0, actor_mgr = 0;
+    unsigned long pool_base = 0, index_buf = 0;
+    unsigned int flag = 0, count = 0, valid = 0;
+    unsigned long count_off = 0;
+    int i;
+
+    ctx->ref_n = 0;
+    ctx->ref_valid = 0;
+    memset(ctx->ref_cfg, 0, sizeof(ctx->ref_cfg));
+
+    if (!g_target_mm) return;
+    b = gc_base();
+    if (!b) return;
+
+    if (!rm(&p_root_slot, b + 0x51EA4D0UL, 8)) return;
+    p_root_slot = untag(p_root_slot);
+    if (!p_root_slot || p_root_slot < 0x100000000UL) return;
+
+    if (!rm(&game_root, p_root_slot, 8)) return;
+    game_root = untag(game_root);
+    if (!game_root || game_root < 0x100000000UL) return;
+
+    if (!rm(&actor_mgr, game_root + 0x388UL, 8)) return;
+    actor_mgr = untag(actor_mgr);
+    if (!actor_mgr || actor_mgr < 0x100000000UL) return;
+
+    rm(&flag, actor_mgr + 0x2EB0UL, 4);
+    count_off = (flag == 0) ? 0x2E8CUL : 0x2EACUL;
+    rm(&count, actor_mgr + count_off, 4);
+    if (count == 0 || count > 512) return;
+
+    rm(&index_buf, actor_mgr + 0x2E90UL, 8);
+    if (!rm(&pool_base, actor_mgr + 0x2E70UL, 8)) return;
+    index_buf = untag(index_buf);
+    pool_base = untag(pool_base);
+    if (!pool_base || pool_base < 0x100000000UL) return;
+
+    for (i = 0; i < (int)count && valid < 10; i++) {
+        int slot = 0;
+        unsigned long entry_addr = 0, hero_ptr = 0;
+        int config_id = 0;
+        unsigned int camp_raw = 0;
+
+        if (flag == 0 || !index_buf) {
+            slot = i;
+        } else {
+            int rel_idx = 0;
+            if (!rm(&rel_idx, index_buf + (unsigned long)i * 4, 4)) continue;
+            slot = rel_idx + i;
+        }
+        if (slot < 0 || slot >= 512) continue;
+
+        entry_addr = pool_base + (unsigned long)slot * 32UL;
+        if (!rm(&hero_ptr, entry_addr + 8UL, 8)) continue;
+        hero_ptr = untag(hero_ptr);
+        if (!hero_ptr || hero_ptr < 0x100000000UL || hero_ptr >= 0x800000000000UL) continue;
+
+        rm(&config_id, hero_ptr + 0x28UL, 4);
+        rm(&camp_raw, hero_ptr + 0x34UL, 4);
+        if (config_id < 100 || config_id > 700) continue;
+
+        ctx->ref_cfg[valid] = config_id;
+        valid++;
+    }
+    ctx->ref_n = (int)valid;
+    ctx->ref_valid = (valid >= 5);  /* 至少找到 5 个英雄才可信 */
+}
+
+/* 检查一块内存是否是位置数组 (至少匹配 8/10 个 config_id 且 +0x20/+0x28 非零) */
+static int fpa_check_entry(unsigned long base, struct fpa_ctx *ctx)
+{
+    int match_cfg = 0;
+    int nonzero_pos = 0;
+    int i;
+
+    for (i = 0; i < 10; i++) {
+        unsigned long entry = base + (unsigned long)i * 0x3F0UL;
+        int cfg = 0;
+        int x = 0, z = 0;
+        unsigned char grass = 0;
+
+        rm(&cfg, entry + 4UL, 4);
+        rm(&x, entry + 0x20UL, 4);
+        rm(&z, entry + 0x28UL, 4);
+        rm(&grass, entry + 0x358UL, 1);
+
+        /* config_id 匹配 (不要求顺序一致) */
+        {
+            int k;
+            for (k = 0; k < ctx->ref_n; k++) {
+                if (ctx->ref_cfg[k] == cfg) { match_cfg++; break; }
+            }
+        }
+
+        /* 坐标非零且在合理范围 */
+        if (x != 0 && z != 0 && x > -60000 && x < 60000 && z > -60000 && z < 60000)
+            nonzero_pos++;
+
+        /* is_in_grass 应该是 0 或小的正数 */
+        if (grass > 200) return 0;
+    }
+
+    return (match_cfg >= 8 && nonzero_pos >= 8);
+}
+
+/* VMA 遍历回调: 在 rw 内存中搜索 */
+static int fpa_scan_cb(void *ud, unsigned long start, unsigned long end, unsigned long flags)
+{
+    struct fpa_ctx *ctx = (struct fpa_ctx *)ud;
+    unsigned long addr, chunk_size;
+    unsigned char *buf = (unsigned char *)g_iobuf;
+
+    if (!(flags & VM_READ) || !(flags & VM_WRITE) || (flags & VM_EXEC)) return 0;
+    if (ctx->found) return 1;  /* already found */
+
+    /* 只扫堆区 (跳过太小和太大的区域) */
+    chunk_size = end - start;
+    if (chunk_size < 0x10000 || chunk_size > 0x10000000) return 0;
+
+    ctx->scanned++;
+
+    for (addr = start; addr < end && !ctx->found; addr += IO_CHUNK) {
+        unsigned long read_size = IO_CHUNK;
+        unsigned long off;
+
+        if (addr + read_size > end) read_size = end - addr;
+        if (read_size < 0x3F0 * 10) continue;  /* 不够放 10 个 entry */
+
+        if (!rm(buf, addr, (int)read_size)) continue;
+
+        /* 在缓冲区中搜索: 检查每个可能的对齐位置 */
+        for (off = 0; off + 0x3F0 * 10 <= read_size; off += 8) {
+            unsigned long candidate = addr + off;
+
+            /* 快速预检: 第一个 entry 的 config_id */
+            {
+                int cfg0 = 0;
+                __builtin_memcpy(&cfg0, buf + off + 4, 4);
+                if (cfg0 < 100 || cfg0 > 700) continue;
+            }
+
+            /* 完整检查 */
+            if (fpa_check_entry(candidate, ctx)) {
+                ctx->found_base = candidate;
+                ctx->found = 1;
+                pr_info("[hero-reader] findposarray: ★ 找到位置数组 base=0x%lx (VMA 0x%lx+%lx)\n",
+                        candidate, start, off);
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static struct fpa_ctx g_fpa;
+
+static int do_findposarray(void)
+{
+    unsigned long b;
+    unsigned long game_root, actor_mgr;
+    unsigned long am_31e8 = 0;  /* [x19+0x31E8] 保存的 entry 指针 */
+    int result = 0;
+
+    if (!g_target_mm) { pr_warn("[hero-reader] findposarray: mm 未锁定\n"); return -1; }
+
+    memset(&g_fpa, 0, sizeof(g_fpa));
+    memset(g_ptc_va, 0, sizeof(g_ptc_va));
+    memset(g_ptc_pa, 0, sizeof(g_ptc_pa));
+
+    /* 1. 获取当前对局的 config_id 集合 */
+    fpa_get_ref_cfgs(&g_fpa);
+    if (!g_fpa.ref_valid) {
+        pr_warn("[hero-reader] findposarray: 无法从 CActorManager 获取参考 config_id\n");
+        return -2;
+    }
+    pr_info("[hero-reader] findposarray: 参考英雄 %d 个: %d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
+            g_fpa.ref_n,
+            g_fpa.ref_cfg[0], g_fpa.ref_cfg[1], g_fpa.ref_cfg[2], g_fpa.ref_cfg[3],
+            g_fpa.ref_cfg[4], g_fpa.ref_cfg[5], g_fpa.ref_cfg[6], g_fpa.ref_cfg[7],
+            g_fpa.ref_cfg[8], g_fpa.ref_cfg[9]);
+
+    /* 2. 先尝试快速路径: 通过 [x19+0x31E8] 获取 */
+    b = gc_base();
+    if (b) {
+        if (rm(&game_root, untag(rptr(b + 0x51EA4D0UL)), 8)) {
+            game_root = untag(game_root);
+            if (game_root > 0x100000000UL) {
+                if (rm(&actor_mgr, game_root + 0x388UL, 8)) {
+                    actor_mgr = untag(actor_mgr);
+                    if (actor_mgr > 0x100000000UL) {
+                        /* 尝试读取 actor_mgr 附近区域的 0x31E8 偏移 */
+                        /* 注意: x19 在 ViewManager 调用中是主上下文, 不一定是 actor_mgr */
+                        /* 这里只是尝试, 不确定偏移 */
+                        rm(&am_31e8, actor_mgr + 0x31E8UL, 8);
+                        am_31e8 = untag(am_31e8);
+                        if (am_31e8 > 0x100000000UL) {
+                            if (fpa_check_entry(am_31e8, &g_fpa)) {
+                                g_fpa.found_base = am_31e8;
+                                g_fpa.found = 1;
+                                pr_info("[hero-reader] findposarray: 快速路径命中! base=0x%lx (actor_mgr+0x31E8)\n", am_31e8);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /* 3. 快速路径失败 → 全堆搜索 */
+    if (!g_fpa.found) {
+        pr_info("[hero-reader] findposarray: 快速路径未命中, 开始堆搜索...\n");
+        vma_walk(fpa_scan_cb, &g_fpa);
+    }
+
+    if (g_fpa.found) {
+        /* 4. 输出找到的数组内容 */
+        int i;
+        pr_info("[hero-reader] findposarray: ★★★ 位置数组 base=0x%lx ★★★\n", g_fpa.found_base);
+        for (i = 0; i < 10; i++) {
+            unsigned long entry = g_fpa.found_base + (unsigned long)i * 0x3F0UL;
+            int cfg = 0, x = 0, y = 0, z = 0;
+            unsigned int camp = 0;
+            unsigned char grass = 0;
+            rm(&cfg, entry + 4UL, 4);
+            rm(&camp, entry + 0x18UL, 4);
+            rm(&x, entry + 0x20UL, 4);
+            rm(&y, entry + 0x24UL, 4);
+            rm(&z, entry + 0x28UL, 4);
+            rm(&grass, entry + 0x358UL, 1);
+            pr_info("[hero-reader]   [%d] cfg=%d camp=%u pos=(%d,%d,%d) grass=%u\n",
+                    i, cfg, camp, x, y, z, grass);
+        }
+        result = 1;
+    } else {
+        pr_warn("[hero-reader] findposarray: 未找到位置数组 (扫描了 %d 个 VMA)\n", g_fpa.scanned);
+        result = 0;
+    }
+
+    return result;
+}
+
 /* ============================================================ 文件重定向 dump (不依赖 dmesg)
  * herostat <path>   — 写英雄摘要到文件 (count / cfg / camp / pos / dead)
  * dumpphase <tag> <path> — 写所有英雄完整 1008 字节 + Transform 链到文件
@@ -3053,6 +3318,11 @@ static long hero_ctl0(const char *args, char *__user out_msg, int outlen)
             if (v >= 0) snprintf(resp, sizeof(resp), "dumpphase %s: %d heroes -> %s", tag, v, path);
             else snprintf(resp, sizeof(resp), "dumpphase %s: 失败 rc=%d", tag, v);
         }
+    } else if (!strcmp(args, "findposarray") || !strcmp(args, "fpa")) {
+        int v = do_findposarray();
+        if (v > 0) snprintf(resp, sizeof(resp), "findposarray: 找到位置数组! (详见 dmesg)");
+        else if (v == 0) snprintf(resp, sizeof(resp), "findposarray: 未找到 (可能不在对局中)");
+        else snprintf(resp, sizeof(resp), "findposarray: 失败 rc=%d", v);
     } else if (!strncmp(args, "peek ", 5)) {
         const char *p = args + 5; unsigned long a = 0; long cnt = 0;
         if (parse_hex(p, &a) && a) {
