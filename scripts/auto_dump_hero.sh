@@ -66,7 +66,7 @@ sleep 3
 log "Phase 1: Detecting stable coords (heroes at base)..."
 PREV_HASH=""
 STABLE_COUNT=0
-MAX_WAIT=120
+MAX_WAIT=30
 WAITED=0
 
 while [ "$WAITED" -lt "$MAX_WAIT" ]; do
@@ -87,6 +87,7 @@ while [ "$WAITED" -lt "$MAX_WAIT" ]; do
   sleep 10
 done
 
+# 无论是否稳定都立即 dump (中途启动时坐标不会稳定)
 collect_dump "T1"
 
 # ============ 阶段 2: T2 连续多次 ============
