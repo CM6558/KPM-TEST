@@ -1,13 +1,13 @@
 #!/system/bin/sh
-# auto_dump_hero.sh — 全文件重定向版, 零 dmesg 依赖
+# auto_dump_hero.sh — 全文件重定向 + T2 连续多次采集版
 #
-# 内核新增 ctl0 命令:
-#   herostat <path>        → 写英雄摘要到文件 (count/cfg/camp/pos/dead)
-#   dumpphase <tag> <path> → 写所有英雄完整 1008B + Transform 链到文件
+# 采集策略:
+#   T1: 开局坐标稳定后 dump 1 次
+#   T2: 从 T1 结束后开始, 每 30 秒 dump 一次, 共 10 次 (覆盖 0~5 分钟全部窗口)
+#   T3: 检测到游戏结束后 dump 1 次
 #
-# 用法: su -c 'sh /data/local/tmp/auto_dump_hero.sh' &
-# 输出: /data/local/tmp/dump_T1.txt, dump_T2.txt, dump_T3.txt
-# 完成: /data/local/tmp/dump_DONE 标记文件
+# 输出: dump_T1.txt, dump_T2_00.txt ~ dump_T2_09.txt, dump_T3.txt
+# 完成: dump_DONE 标记文件
 
 KSUD="/data/adb/ksud"
 CMD="$KSUD kpm control hero-reader"
@@ -15,9 +15,11 @@ OUTDIR="/data/local/tmp"
 LOG="$OUTDIR/auto_dump.log"
 STATFILE="$OUTDIR/.herostat.tmp"
 
+T2_INTERVAL=30     # T2 每次采集间隔 (秒)
+T2_MAX=10          # T2 最多采集次数 (30s × 10 = 300s = 5min 覆盖)
+
 log() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$LOG"; }
 
-# --- 从 herostat 文件读英雄数 ---
 get_hero_count() {
   $CMD "herostat $STATFILE" >/dev/null 2>&1
   sleep 0.5
@@ -25,35 +27,33 @@ get_hero_count() {
   echo "${COUNT:-0}"
 }
 
-# --- 从 herostat 文件生成坐标 hash (变化检测) ---
 get_coord_hash() {
   $CMD "herostat $STATFILE" >/dev/null 2>&1
   sleep 0.5
   grep 'pos=(' "$STATFILE" 2>/dev/null | md5sum | cut -d' ' -f1
 }
 
-# --- 采集完整 dump (纯文件重定向) ---
 collect_dump() {
   TAG=$1
   OUTFILE="$OUTDIR/dump_${TAG}.txt"
-  log "Collecting ${TAG} dump to $OUTFILE"
   $CMD "dumpphase $TAG $OUTFILE" >/dev/null 2>&1
   sleep 1
   LINES=$(wc -l < "$OUTFILE" 2>/dev/null)
   HEROES=$(grep -c '^=== Hero' "$OUTFILE" 2>/dev/null)
-  log "${TAG} dump complete: $OUTFILE ($LINES lines, $HEROES heroes)"
+  log "${TAG}: $OUTFILE ($LINES lines, $HEROES heroes)"
 }
 
 # --- 主逻辑 ---
-log "=== Auto Dump Hero Started (zero-dmesg mode) ==="
+log "=== Auto Dump Hero Started (multi-T2 mode) ==="
 rm -f "$OUTDIR/dump_DONE" "$STATFILE"
+rm -f "$OUTDIR"/dump_T2_*.txt
 
 # ============ 阶段 0: 等待进入游戏 ============
 log "Phase 0: Waiting for game start..."
 while true; do
   COUNT=$(get_hero_count)
   if [ "$COUNT" -gt 0 ] 2>/dev/null; then
-    log "Game started: $COUNT heroes detected"
+    log "Game started: $COUNT heroes"
     break
   fi
   log "  waiting... (heroes=$COUNT)"
@@ -62,9 +62,8 @@ done
 
 sleep 3
 
-# ============ 阶段 1: T1 = 开局 (坐标稳定检测) ============
-log "Phase 1: Detecting game start (heroes at base)..."
-
+# ============ 阶段 1: T1 = 开局 (坐标稳定) ============
+log "Phase 1: Detecting stable coords (heroes at base)..."
 PREV_HASH=""
 STABLE_COUNT=0
 MAX_WAIT=120
@@ -74,14 +73,14 @@ while [ "$WAITED" -lt "$MAX_WAIT" ]; do
   HASH=$(get_coord_hash)
   if [ "$HASH" = "$PREV_HASH" ] && [ -n "$HASH" ]; then
     STABLE_COUNT=$((STABLE_COUNT + 1))
-    log "  coords stable ($STABLE_COUNT/3)"
+    log "  stable ($STABLE_COUNT/3)"
     if [ "$STABLE_COUNT" -ge 3 ]; then
-      log "T1: Coords stable — heroes at base"
+      log "T1: Coords stable — at base"
       break
     fi
   else
     STABLE_COUNT=0
-    log "  coords changing..."
+    log "  changing..."
   fi
   PREV_HASH="$HASH"
   WAITED=$((WAITED + 10))
@@ -90,11 +89,19 @@ done
 
 collect_dump "T1"
 
-# ============ 阶段 2: T2 = 对局中 ============
-log "Phase 2: Waiting 60s for mid-game..."
-sleep 60
-log "T2: Mid-game dump"
-collect_dump "T2"
+# ============ 阶段 2: T2 连续多次 ============
+log "Phase 2: Multi-T2 collection (${T2_MAX} dumps, ${T2_INTERVAL}s interval = $(( T2_MAX * T2_INTERVAL / 60 ))min coverage)"
+
+I=0
+while [ "$I" -lt "$T2_MAX" ]; do
+  TAG=$(printf "T2_%02d" $I)
+  collect_dump "$TAG"
+  log "  T2 progress: $((I + 1))/${T2_MAX} (elapsed $(( (I + 1) * T2_INTERVAL ))s)"
+  I=$((I + 1))
+  if [ "$I" -lt "$T2_MAX" ]; then
+    sleep "$T2_INTERVAL"
+  fi
+done
 
 # ============ 阶段 3: T3 = 游戏结束 ============
 log "Phase 3: Detecting game end..."
@@ -110,7 +117,7 @@ while [ "$WAITED" -lt "$MAX_WAIT_END" ]; do
     T3_DONE=1
     break
   fi
-  log "  waiting for game end... heroes=$CUR_COUNT"
+  log "  waiting... heroes=$CUR_COUNT"
   WAITED=$((WAITED + 10))
   sleep 10
 done
@@ -126,6 +133,8 @@ fi
 rm -f "$STATFILE"
 touch "$OUTDIR/dump_DONE"
 log "=== Auto Dump Hero Complete ==="
-log "  $OUTDIR/dump_T1.txt"
-log "  $OUTDIR/dump_T2.txt"
-log "  $OUTDIR/dump_T3.txt"
+log "Files:"
+log "  dump_T1.txt  (开局)"
+ls "$OUTDIR"/dump_T2_*.txt 2>/dev/null | while read f; do log "  $(basename $f)"; done
+log "  dump_T3.txt  (结束)"
+log "Total files: $(ls "$OUTDIR"/dump_T*.txt 2>/dev/null | wc -l)"
