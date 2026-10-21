@@ -2026,6 +2026,8 @@ static int read_rootactor_chain(void)
     int i;
 
     if (!g_target_mm) return -1;
+    memset(g_ptc_va, 0, sizeof(g_ptc_va));
+    memset(g_ptc_pa, 0, sizeof(g_ptc_pa));
     b = gc_base();
     if (!b) return -2;
 
@@ -2181,6 +2183,9 @@ static int hr_walk_heroes(hr_hero_cb cb, void *ud)
     int i, ret = 0;
 
     if (!g_target_mm) return -1;
+    /* 清空页表翻译缓存: 游戏运行中会重新映射内存页, 缓存的 PA 会过期 */
+    memset(g_ptc_va, 0, sizeof(g_ptc_va));
+    memset(g_ptc_pa, 0, sizeof(g_ptc_pa));
     b = gc_base();
     if (!b) return -2;
 
