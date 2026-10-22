@@ -442,55 +442,100 @@ static void hbin_write(void)
 
 static int get_actor_coords(unsigned long actor, int *ox, int *oy, int *oz)
 {
-    unsigned long node = 0, link = 0, tr = 0, p2 = 0;
-    unsigned long node2 = 0, link2 = 0;
     int xx = 0, yy = 0, zz = 0;
+    unsigned long val = 0;
 
-    /* 唯一路径: 权威物理变换链 Transform (帧同步模拟层权威真值, 迷雾不冻结)
-     * ★ 不再回调到 +32/+40/+44 (SetSpawnPosition 是出生点缓存, 开局后不更新)
-     * ★ seqlock: 读完整个链路后重读 node/link 比对一致性
+    /* ============================================================================
+     * 主路径: hero+0x10/+0x18 — 服务器权威位置 (ViewManager 不混淆此字段!)
+     *
+     * 证据 (Unicorn + capstone 离线验证):
+     *   1. sub_36A2678 (每帧更新) 设置 hero+0x1d = 1 (server_auth flag恒为1)
+     *   2. sub_36A2B44 (每帧位置同步) 检查 hero+0x1d:
+     *      if 1 → 直接读 hero+0x10 (8字节,低32=X_mm) + hero+0x18 (4字节,Y_mm)
+     *   3. ViewManager (sub_24AEAC0) 只写 55000 到 hero+0x20/+0x28
+     *      → ViewManager 不碰 hero+0x10/+0x18!
+     *   4. 因此 hero+0x10/+0x18 始终是物理引擎更新的真实坐标
+     *
+     * hero+0x10 布局:
+     *   +0x10: 低32位 = X 坐标 (毫米)
+     *   +0x14: 高32位 = (packed 其他数据)
+     *   +0x18: Y 坐标 (4字节, 毫米)
+     *
+     * 反汇编证据 (sub_36A2B44):
+     *   0x36a2bf0: ldr  x0, [x19, #0x10]    ; x0 = *(hero+0x10) — 8字节
+     *   0x36a2bf4: ldr  w1, [x19, #0x18]    ; w1 = *(hero+0x18) — 4字节
+     * ============================================================================
      */
-    if (!rm(&node, actor + 0xA8UL, 8)) return 0;
-    node = untag(node);
-    if (node <= 0x100000000UL || node >= 0x800000000000UL) return 0;
 
-    if (!rm(&link, node + 0x10UL, 8)) return 0;
-    link = untag(link);
-    if (link <= 0x100000000UL || link >= 0x800000000000UL) return 0;
+    /* 读 hero+0x10 低32位 = X (毫米) */
+    if (!rm(&xx, actor + 0x10UL, 4)) return 0;
+    /* 读 hero+0x18 = Y (毫米) */
+    if (!rm(&yy, actor + 0x18UL, 4)) return 0;
 
-    if (!rm(&tr, link + 0x00UL, 8)) return 0;
-    tr = untag(tr);
-    if (tr <= 0x100000000UL || tr >= 0x800000000000UL) return 0;
+    /* ViewManager 混淆值检测: 55000 是混淆标记值
+     * (虽然 ViewManager 不直接写 hero+0x10, 但做安全检测) */
+    if (xx == 55000 || xx == -55000 || yy == 55000 || yy == -55000)
+        goto fallback_transform;
 
-    if (!rm(&p2, tr + 0x60UL, 8)) return 0;
-    p2 = untag(p2);
-    if (p2 <= 0x100000000UL || p2 >= 0x800000000000UL) return 0;
+    /* 数值合理性检查 (地图坐标范围 ±30km = ±3,000,000 mm) */
+    if (xx == 0 && yy == 0) goto fallback_transform;
+    if (xx < -3000000 || xx > 3000000) goto fallback_transform;
+    if (yy < -3000000 || yy > 3000000) goto fallback_transform;
 
-    /* 读 VInt3 三字段 (毫米, ÷10 = 厘米) */
-    rm(&xx, p2 + 0, 4);
-    rm(&yy, p2 + 4, 4);
-    rm(&zz, p2 + 8, 4);
-
-    /* seqlock: 重读 node/link 比对,确认中间未被物理引擎切换 */
-    rm(&node2, actor + 0xA8UL, 8);
-    node2 = untag(node2);
-    if (node2 != node) return 0;   /* node 已换,读到的坐标可能跨期 → 丢弃 */
-    rm(&link2, node + 0x10UL, 8);
-    link2 = untag(link2);
-    if (link2 != link) return 0;   /* link 已换, 丢弃 */
-
-    /* 数值合理性检查 (地图 ±30km; Z 通常 < 2km 但是容许) */
-    if (xx == 0 && zz == 0) return 0;
-    if (xx < -3000000 || xx > 3000000) return 0;
-    if (zz < -3000000 || zz > 3000000) return 0;
-
-    /* 单位转换: 毫米 → 厘米 */
-    *ox = xx / 10;
+    /* 成功: hero+0x10/+0x18 是未被混淆的真实位置 */
+    *ox = xx / 10;    /* 毫米 → 厘米 */
     *oy = yy / 10;
-    *oz = zz / 10;
+    *oz = 0;           /* Z 不在此字段, 设为0 */
     return 1;
 
-    /* ★ 绝不再 fallback 到路径 2 (+32/+40/+44 = SetSpawnPosition, 开局后不更新) */
+    /* ============================================================================
+     * 回退路径: Transform 变换链 (hero+0xA8 → Node → Link → Transform → VInt3)
+     * 当 hero+0x10/+0x18 读取失败或异常时使用
+     * (Transform 链也有迷雾混淆风险, 仅作为最后手段)
+     * ============================================================================
+     */
+fallback_transform:
+    {
+        unsigned long node = 0, link = 0, tr = 0, p2 = 0;
+        unsigned long node2 = 0, link2 = 0;
+
+        if (!rm(&node, actor + 0xA8UL, 8)) return 0;
+        node = untag(node);
+        if (node <= 0x100000000UL || node >= 0x800000000000UL) return 0;
+
+        if (!rm(&link, node + 0x10UL, 8)) return 0;
+        link = untag(link);
+        if (link <= 0x100000000UL || link >= 0x800000000000UL) return 0;
+
+        if (!rm(&tr, link + 0x00UL, 8)) return 0;
+        tr = untag(tr);
+        if (tr <= 0x100000000UL || tr >= 0x800000000000UL) return 0;
+
+        if (!rm(&p2, tr + 0x60UL, 8)) return 0;
+        p2 = untag(p2);
+        if (p2 <= 0x100000000UL || p2 >= 0x800000000000UL) return 0;
+
+        rm(&xx, p2 + 0, 4);
+        rm(&yy, p2 + 4, 4);
+        rm(&zz, p2 + 8, 4);
+
+        /* seqlock: 重读 node/link 比对一致性 */
+        rm(&node2, actor + 0xA8UL, 8);
+        node2 = untag(node2);
+        if (node2 != node) return 0;
+        rm(&link2, node + 0x10UL, 8);
+        link2 = untag(link2);
+        if (link2 != link) return 0;
+
+        if (xx == 0 && zz == 0) return 0;
+        if (xx < -3000000 || xx > 3000000) return 0;
+        if (zz < -3000000 || zz > 3000000) return 0;
+
+        *ox = xx / 10;
+        *oy = yy / 10;
+        *oz = zz / 10;
+        return 1;
+    }
 }
 
 /*
