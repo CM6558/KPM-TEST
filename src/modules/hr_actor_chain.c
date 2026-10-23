@@ -394,6 +394,35 @@ static unsigned long gc_base(void)
  * 严格按照 sub_3CFFEF8 与 sub_45ACA90 机器汇编实现
  */
 
+/* 文本日志写入 — 替代 dmesg, 避免被冲掉 */
+static char    g_log_path[160] = "/data/local/tmp/hero_log.txt";
+static int     g_log_first     = 1;
+static char    g_log_buf[4096];
+
+static void hr_log(const char *fmt, ...)
+{
+    void *f = NULL;
+    va_list ap;
+    int len;
+    long long p = 0;
+
+    if (!p_filp_open || !p_kernel_write || !p_filp_close) return;
+
+    va_start(ap, fmt);
+    len = vsnprintf(g_log_buf, sizeof(g_log_buf) - 2, fmt, ap);
+    va_end(ap);
+    if (len <= 0) return;
+    if ((unsigned long)len >= sizeof(g_log_buf) - 2) len = sizeof(g_log_buf) - 3;
+    g_log_buf[len++] = '\n';
+    g_log_buf[len] = '\0';
+
+    f = p_filp_open(g_log_path, KPM_O_WRONLY | KPM_O_CREAT | (g_log_first ? KPM_O_TRUNC : 0) | KPM_O_APPEND, 0644);
+    if (!f || (unsigned long)f >= (unsigned long)-4095UL) return;
+    g_log_first = 0;
+    p_kernel_write(f, g_log_buf, len, &p);
+    p_filp_close(f, NULL);
+}
+
 static void hbin_write(void)
 {
     void *f = NULL, *old_cred = NULL;
@@ -494,7 +523,7 @@ static int read_combat_position(unsigned long game_root, unsigned long gcbase,
     count = (int)((list_end - list_start) / 64UL);
     if (count <= 0 || count > 20) return 0;
 
-    pr_info("[hero-reader] combat: cm=0x%lx list=0x%lx-0x%lx count=%d\n",
+    hr_log("[hero-reader] combat: cm=0x%lx list=0x%lx-0x%lx count=%d",
             combat_mgr, list_start, list_end, count);
 
     for (i = 0; i < count && valid < max_recs; i++) {
@@ -523,7 +552,7 @@ static int read_combat_position(unsigned long game_root, unsigned long gcbase,
         if (xx < -3000000 || xx > 3000000) continue;
         if (yy < -3000000 || yy > 3000000) continue;
 
-        pr_info("[hero-reader]   [#%02d] combat_item=%d pos=(%d,%d) cm\n",
+        hr_log("[hero-reader]   [#%02d] combat_item=%d pos=(%d,%d) cm",
                 valid, actor_id, xx / 10, yy / 10);
 
         rb = &recs[valid];
@@ -576,7 +605,7 @@ static int read_rootactor_chain(void)
     rm(&flag, actor_mgr + 0x2EB0UL, 4);
     count_off = (flag == 0) ? 0x2E8CUL : 0x2EACUL;
     rm(&count, actor_mgr + count_off, 4);
-    pr_info("[hero-reader] rootactor: gc_base=0x%lx root=0x%lx am=0x%lx flag=%u off=0x%lx count=%u\n",
+    hr_log("[hero-reader] rootactor: gc_base=0x%lx root=0x%lx am=0x%lx flag=%u off=0x%lx count=%u",
             b, game_root, actor_mgr, flag, count_off, count);
     if (count == 0 || count > 512) return -9;
 
@@ -585,7 +614,7 @@ static int read_rootactor_chain(void)
     if (!rm(&pool_base, actor_mgr + 0x2E70UL, 8)) return -10;
     index_buf = untag(index_buf);
     pool_base = untag(pool_base);
-    pr_info("[hero-reader] rootactor: flag=%u count=%u pool=0x%lx idx=0x%lx\n", flag, count, pool_base, index_buf);
+    hr_log("[hero-reader] rootactor: flag=%u count=%u pool=0x%lx idx=0x%lx", flag, count, pool_base, index_buf);
     if (!pool_base || pool_base < 0x100000000UL) return -11;
 
     /* ========================================================================
@@ -621,7 +650,7 @@ static int read_rootactor_chain(void)
                 if (c_list_start >= 0x100000000UL && c_list_end >= c_list_start) {
                     c_count = (int)((c_list_end - c_list_start) / 64UL);
                     if (c_count > 0 && c_count <= 20) {
-                        pr_info("[hero-reader] combat: cm=0x%lx list=0x%lx count=%d\n",
+                        hr_log("[hero-reader] combat: cm=0x%lx list=0x%lx count=%d",
                                 combat_mgr, c_list_start, c_count);
                         for (j = 0; j < c_count && c_valid < HB_MAXREC; j++) {
                             unsigned long citem = c_list_start + (unsigned long)j * 64UL;
@@ -640,7 +669,7 @@ static int read_rootactor_chain(void)
                 }
             }
         }
-        pr_info("[hero-reader] combat: c_valid=%d\n", c_valid);
+        hr_log("[hero-reader] combat: c_valid=%d", c_valid);
 
         /* Step B: 从 CActorManager Hero 池读元数据, 匹配 config_id 填入战斗位置 */
         memset(g_bin_rec, 0, sizeof(g_bin_rec));
@@ -692,8 +721,7 @@ static int read_rootactor_chain(void)
                     }
                 }
 
-                /* pr_info 包含调试数据: hero_ptr(config_id来源), found(是否在战斗列表匹配到) */
-                pr_info("[hero-reader]   [#%02d] slot=%d hero=0x%lx cfg=%d camp=%u rt=%d cpos=(%d,%d) found=%d en=%u st=%u grass=%u hpv=%d\n",
+                hr_log("[hero-reader]   [#%02d] slot=%d hero=0x%lx cfg=%d camp=%u rt=%d cpos=(%d,%d) found=%d en=%u st=%u grass=%u hpv=%d",
                         valid, slot, hero_ptr, config_id, camp_raw, runtime_id,
                         real_x, real_y, found, enabled_flag, state_code, is_in_grass, hero_ptr_valid);
 
