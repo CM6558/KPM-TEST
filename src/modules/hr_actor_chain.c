@@ -440,57 +440,105 @@ static void hbin_write(void)
     if (old_cred && p_revert_creds) p_revert_creds(old_cred);
 }
 
-/* Hero vtable 地址 (构造函数最终写入 hero+0 的值)
- * 证据: 0x36A2cf4: str x9, [x19]  where x9 = 0x4dacd10
- * 运行时由 R_AARCH64_RELATIVE 重定位为 gc_base + 0x4dacd10
- * 用作类型标记: 如果 hero+0 != gc_base + 0x4dacd10 → 不是 Hero 对象 */
-#define HERO_VTABLE_OFF  0x4dacd10UL
+/* Combat manager vtable 地址 (运行时: gc_base + 0x4b7d8b8)
+ * 证据: 构造函数 0x2803be8: str x8, [x19] where x8 = gc_base + 0x4b7d8b8
+ * 用作类型标记 */
+#define COMBAT_MGR_VTABLE_OFF  0x4b7d8b8UL
 
-static int get_actor_coords(unsigned long actor, unsigned long gcbase,
-                            int *ox, int *oy, int *oz)
+/*
+ * 战斗系统位置读取 — 不受迷雾/隐身影响
+ *
+ * 证据链:
+ *   1. CanHitTarget (0x2801ae4) 日志: "target_id:%d, target_pos:%d,%d"
+ *      w5=*(item+0)=id, w6=*(item+4)=X, w7=*(item+12)=Y
+ *   2. 距离函数 sub_3AC94A8: pos2=item+4, 读 *(pos2+0)=X, *(pos2+8)=Y
+ *   3. item 步长 0x40 (64字节): add x23, x23, #0x40
+ *   4. combat_manager+0x4A8 = list_start (指向 combat_manager+0x4B0 内联)
+ *   5. combat_manager+0x4B0 = list_end
+ *   6. GameRoot+0x4F0 = combat_manager 指针
+ *   7. sub_3CFFEF8 验证: LDR w9,[cm+0xc]; LDR w10,[gr+0x4f8]; CMP w9,w10
+ *
+ * Item 布局 (64 bytes):
+ *   +0x00: actor_id (int32, 对应 config_id 100-700)
+ *   +0x04: position_X (int32, 毫米)
+ *   +0x0C: position_Y (int32, 毫米)
+ */
+static int read_combat_position(unsigned long game_root, unsigned long gcbase,
+                                struct hb_rec *recs, int max_recs)
 {
-    int xx = 0, yy = 0;
-    unsigned long vt = 0, vt2 = 0;
-    unsigned long expected_vt = gcbase + HERO_VTABLE_OFF;
+    unsigned long combat_mgr = 0, expected_vt = 0, vt = 0;
+    unsigned long list_start = 0, list_end = 0;
+    int valid = 0, i;
+    int count;
 
-    /* ============================================================================
-     * 主路径: hero+0x3e8 (X_mm) + hero+0x3ec (Y_mm)
-     *
-     * 这是战斗系统 CanHitTarget (0x2801ae4, GOT@0x509d0b0) 读取的位置源。
-     * CanHitTarget 调用 sub_3AC94A8 距离函数, 距离函数读 *(pos+0) 和 *(pos+8):
-     *   pos1 = actor_struct+0x3e8  (本机英雄位置, 由 sub_25284f0 从 +0x3e8 拷贝)
-     *   pos2 = target+0x4         (目标位置)
-     *
-     * 战斗系统必须用真实坐标做命中判定, 不能被 ViewManager 混淆。
-     * 55000 (0xD6D8) 只出现在 sub_24AEAC0, 写入 view data entry 而非 Hero 对象。
-     *
-     * VTABLE 校验: 构造函数最终写 0x4dacd10 到 hero+0。
-     *   如果 hero+0 != gc_base + 0x4dacd10 → 对象不是 Hero, 丢弃。
-     *   读完位置后重读 hero+0, 确保中间未被释放/重用。
-     * ============================================================================
-     */
+    /* GameRoot + 0x4F0 → combat_manager */
+    if (!rm(&combat_mgr, game_root + 0x4F0UL, 8)) return 0;
+    combat_mgr = untag(combat_mgr);
+    if (!combat_mgr || combat_mgr < 0x100000000UL) return 0;
 
-    /* 校验 vtable: hero+0 必须等于 gc_base + 0x4dacd10 */
-    if (!rm(&vt, actor, 8)) return 0;
+    /* Vtable 校验: combat_manager+0 == gc_base + 0x4b7d8b8 */
+    expected_vt = gcbase + COMBAT_MGR_VTABLE_OFF;
+    if (!rm(&vt, combat_mgr, 8)) return 0;
     if (vt != expected_vt) return 0;
 
-    /* 读位置: hero+0x3e8 = X (mm), hero+0x3ec = Y (mm) */
-    if (!rm(&xx, actor + 0x3e8UL, 4)) return 0;
-    if (!rm(&yy, actor + 0x3ecUL, 4)) return 0;
+    /* combat_manager + 0x4A8 → list_start (指向内联数组) */
+    if (!rm(&list_start, combat_mgr + 0x4A8UL, 8)) return 0;
+    list_start = untag(list_start);
+    /* combat_manager + 0x4B0 → list_end */
+    if (!rm(&list_end, combat_mgr + 0x4B0UL, 8)) return 0;
+    list_end = untag(list_end);
 
-    /* seqlock: 重读 vtable 确保对象在读位置期间未被释放 */
-    if (!rm(&vt2, actor, 8)) return 0;
-    if (vt2 != vt) return 0;
+    if (!list_start || list_start < 0x100000000UL) return 0;
+    if (list_end < list_start) return 0;
 
-    /* 数值合理性: ±30km = ±3,000,000 mm; 零值 = 未初始化 */
-    if (xx == 0 && yy == 0) return 0;
-    if (xx < -3000000 || xx > 3000000) return 0;
-    if (yy < -3000000 || yy > 3000000) return 0;
+    count = (int)((list_end - list_start) / 64UL);
+    if (count <= 0 || count > 20) return 0;
 
-    *ox = xx / 10;    /* 毫米 → 厘米 */
-    *oy = yy / 10;
-    *oz = 0;
-    return 1;
+    pr_info("[hero-reader] combat: cm=0x%lx list=0x%lx-0x%lx count=%d\n",
+            combat_mgr, list_start, list_end, count);
+
+    for (i = 0; i < count && valid < max_recs; i++) {
+        unsigned long item = list_start + (unsigned long)i * 64UL;
+        int actor_id = 0, xx = 0, yy = 0;
+        unsigned long vt2 = 0;
+        struct hb_rec *rb;
+
+        /* item+0: actor_id */
+        if (!rm(&actor_id, item + 0x00UL, 4)) continue;
+
+        /* 过滤: 英雄 config_id 范围 */
+        if (actor_id < 100 || actor_id > 700) continue;
+
+        /* item+4: position_X (mm) */
+        if (!rm(&xx, item + 0x04UL, 4)) continue;
+        /* item+0x0C: position_Y (mm) */
+        if (!rm(&yy, item + 0x0CUL, 4)) continue;
+
+        /* seqlock: 重读 vtable 确保对象未变 */
+        if (!rm(&vt2, combat_mgr, 8)) continue;
+        if (vt2 != vt) continue;
+
+        /* 数值合理性: ±30km */
+        if (xx == 0 && yy == 0) continue;
+        if (xx < -3000000 || xx > 3000000) continue;
+        if (yy < -3000000 || yy > 3000000) continue;
+
+        pr_info("[hero-reader]   [#%02d] combat_item=%d pos=(%d,%d) cm\n",
+                valid, actor_id, xx / 10, yy / 10);
+
+        rb = &recs[valid];
+        rb->heroid = (uint32_t)actor_id;
+        rb->objid = 0;  /* combat list 没有 runtime_id */
+        rb->x = xx / 10;    /* mm → cm */
+        rb->y = yy / 10;
+        rb->z = 0;
+        rb->mx = xx / 10;
+        rb->mz = yy / 10;
+        rb->dead = 0;
+        valid++;
+    }
+
+    return valid;
 }
 
 /*
@@ -540,70 +588,122 @@ static int read_rootactor_chain(void)
     pr_info("[hero-reader] rootactor: flag=%u count=%u pool=0x%lx idx=0x%lx\n", flag, count, pool_base, index_buf);
     if (!pool_base || pool_base < 0x100000000UL) return -11;
 
-    memset(g_bin_rec, 0, sizeof(g_bin_rec));
+    /* ========================================================================
+     * 位置来源: 战斗系统列表 (不受迷雾/隐身影响)
+     * 同时读取 CActorManager Hero 池获取元数据 (config_id, camp, hp等)
+     * combat list 提供 item→config_id→position 映射
+     * ========================================================================
+     */
 
-    /* Level 4: 查表遍历 (flag==0 时为直接步进 i, flag!=0 时查 index_buf) */
-    for (i = 0; i < (int)count && valid < HB_MAXREC; i++) {
-        int rel_idx = 0, slot = 0;
-        unsigned long entry_addr = 0, hero_ptr = 0;
-        int config_id = 0, runtime_id = 0, real_x = 0, real_y = 0, real_z = 0;
-        unsigned int enabled_flag = 0, state_code = 0;
-        unsigned char is_in_grass = 0;
-        unsigned int camp_raw = 0;
-        struct hb_rec *rb;
+    /* Step A: 从战斗系统列表读位置, 建立 config_id → (x,y) 映射表 */
+    {
+        unsigned long combat_mgr = 0, expected_vt_c = b + COMBAT_MGR_VTABLE_OFF;
+        unsigned long c_vt = 0, c_list_start = 0, c_list_end = 0;
+        unsigned long c_hero_id_map[HB_MAXREC];
+        int c_pos_x[HB_MAXREC], c_pos_y[HB_MAXREC];
+        int c_count;
+        int c_valid = 0;
+        int j;
 
-        if (flag == 0 || !index_buf) {
-            slot = i;
-        } else {
-            if (!rm(&rel_idx, index_buf + (unsigned long)i * 4, 4)) continue;
-            slot = rel_idx + i;
-        }
-        if (slot < 0 || slot >= 512) continue;
+        memset(c_hero_id_map, 0, sizeof(c_hero_id_map));
+        memset(c_pos_x, 0, sizeof(c_pos_x));
+        memset(c_pos_y, 0, sizeof(c_pos_y));
 
-        entry_addr = pool_base + (unsigned long)slot * 32UL;
-        if (!rm(&hero_ptr, entry_addr + 8UL, 8)) continue;
-        hero_ptr = untag(hero_ptr);
-        if (!hero_ptr || hero_ptr < 0x100000000UL || hero_ptr >= 0x800000000000UL) continue;
-
-        rm(&runtime_id, hero_ptr + 8UL, 4);
-        rm(&config_id, hero_ptr + 0x28UL, 4);
-        rm(&camp_raw, hero_ptr + 0x34UL, 4);
-        rm(&enabled_flag, hero_ptr + 88UL, 4);
-        rm(&state_code, hero_ptr + 92UL, 4);
-        rm(&is_in_grass, hero_ptr + 712UL, 1);
-
-        /* ★ 根因 #4 修复: IndexBuffer seqlock 校验
-         * 读完 Hero 后, 重读 flag + IndexBuffer[i] 比对一致性
-         * 若容器结构在读取过程中被改 → 跳过这一帧 */
-        {
-            unsigned int flag2 = 0;
-            unsigned long index_buf2 = 0;
-            rm(&flag2, actor_mgr + 0x2EB0UL, 4);
-            rm(&index_buf2, actor_mgr + 0x2E90UL, 8);
-            index_buf2 = untag(index_buf2);
-            if (flag2 != flag || index_buf2 != index_buf) continue;
-            /* IndexBuffer 内容也校验 (重读 IndexBuffer[i] 比对 slot) */
-            if (flag != 0 && index_buf) {
-                int rel_idx2 = 0;
-                rm(&rel_idx2, index_buf + (unsigned long)i * 4, 4);
-                if (rel_idx2 != rel_idx) continue;
+        rm(&combat_mgr, game_root + 0x4F0UL, 8);
+        combat_mgr = untag(combat_mgr);
+        if (combat_mgr && combat_mgr >= 0x100000000UL) {
+            rm(&c_vt, combat_mgr, 8);
+            if (c_vt == expected_vt_c) {
+                rm(&c_list_start, combat_mgr + 0x4A8UL, 8);
+                rm(&c_list_end, combat_mgr + 0x4B0UL, 8);
+                c_list_start = untag(c_list_start);
+                c_list_end = untag(c_list_end);
+                if (c_list_start >= 0x100000000UL && c_list_end >= c_list_start) {
+                    c_count = (int)((c_list_end - c_list_start) / 64UL);
+                    if (c_count > 0 && c_count <= 20) {
+                        pr_info("[hero-reader] combat: cm=0x%lx list=0x%lx count=%d\n",
+                                combat_mgr, c_list_start, c_count);
+                        for (j = 0; j < c_count && c_valid < HB_MAXREC; j++) {
+                            unsigned long citem = c_list_start + (unsigned long)j * 64UL;
+                            int cid = 0, cx = 0, cy = 0;
+                            rm(&cid, citem + 0x00UL, 4);
+                            rm(&cx, citem + 0x04UL, 4);
+                            rm(&cy, citem + 0x0CUL, 4);
+                            if (cid < 100 || cid > 700) continue;
+                            if (cx == 0 && cy == 0) continue;
+                            c_hero_id_map[c_valid] = (unsigned long)cid;
+                            c_pos_x[c_valid] = cx;
+                            c_pos_y[c_valid] = cy;
+                            c_valid++;
+                        }
+                    }
+                }
             }
         }
+        pr_info("[hero-reader] combat: c_valid=%d\n", c_valid);
 
-        /* 过滤：王者荣耀英雄ID通常在 100~700 之间 (如105廉颇..585元流之子) */
-        if (config_id < 100 || config_id > 700) continue;
+        /* Step B: 从 CActorManager Hero 池读元数据, 匹配 config_id 填入战斗位置 */
+        memset(g_bin_rec, 0, sizeof(g_bin_rec));
 
-        get_actor_coords(hero_ptr, b, &real_x, &real_y, &real_z);
+        for (i = 0; i < (int)count && valid < HB_MAXREC; i++) {
+            int rel_idx = 0, slot = 0;
+            unsigned long entry_addr = 0, hero_ptr = 0;
+            int config_id = 0, runtime_id = 0;
+            unsigned int enabled_flag = 0, state_code = 0;
+            unsigned char is_in_grass = 0;
+            unsigned int camp_raw = 0;
+            int hero_ptr_valid = 0;
+            struct hb_rec *rb;
 
-        pr_info("[hero-reader]   [#%02d] slot=%d hero=0x%lx cfg=%d camp=%u rt=%d pos=(%d,%d) cm en=%u st=%u grass=%u\n",
-                valid, slot, hero_ptr, config_id, camp_raw, runtime_id, real_x, real_z, enabled_flag, state_code, is_in_grass);
+            if (flag == 0 || !index_buf) {
+                slot = i;
+            } else {
+                if (!rm(&rel_idx, index_buf + (unsigned long)i * 4, 4)) continue;
+                slot = rel_idx + i;
+            }
+            if (slot < 0 || slot >= 512) continue;
 
-        rb = &g_bin_rec[valid];
-        rb->heroid = (uint32_t)config_id;
-        rb->objid = (uint32_t)runtime_id;
-        rb->x = real_x;
-        rb->y = real_y;
-        rb->z = real_z;
-        rb->mx = real_x;
-        rb->mz = real_z;
-        rb->dead = 0;   /* 对局英雄默认标记存活 */
+            entry_addr = pool_base + (unsigned long)slot * 32UL;
+            if (!rm(&hero_ptr, entry_addr + 8UL, 8)) continue;
+            hero_ptr = untag(hero_ptr);
+            if (!hero_ptr || hero_ptr < 0x100000000UL || hero_ptr >= 0x800000000000UL) continue;
+
+            rm(&runtime_id, hero_ptr + 8UL, 4);
+            rm(&config_id, hero_ptr + 0x28UL, 4);
+            rm(&camp_raw, hero_ptr + 0x34UL, 4);
+            rm(&enabled_flag, hero_ptr + 88UL, 4);
+            rm(&state_code, hero_ptr + 92UL, 4);
+            rm(&is_in_grass, hero_ptr + 712UL, 1);
+            hero_ptr_valid = 1;
+
+            /* 过滤：王者荣耀英雄ID通常在 100~700 之间 */
+            if (config_id < 100 || config_id > 700) continue;
+
+            /* Step C: 匹配战斗列表位置 */
+            {
+                int real_x = 0, real_y = 0, real_z = 0;
+                int found = 0;
+                for (j = 0; j < c_valid; j++) {
+                    if ((int)c_hero_id_map[j] == config_id) {
+                        real_x = c_pos_x[j] / 10;  /* mm → cm */
+                        real_y = c_pos_y[j] / 10;
+                        found = 1;
+                        break;
+                    }
+                }
+
+                /* pr_info 包含调试数据: hero_ptr(config_id来源), found(是否在战斗列表匹配到) */
+                pr_info("[hero-reader]   [#%02d] slot=%d hero=0x%lx cfg=%d camp=%u rt=%d cpos=(%d,%d) found=%d en=%u st=%u grass=%u hpv=%d\n",
+                        valid, slot, hero_ptr, config_id, camp_raw, runtime_id,
+                        real_x, real_y, found, enabled_flag, state_code, is_in_grass, hero_ptr_valid);
+
+                rb = &g_bin_rec[valid];
+                rb->heroid = (uint32_t)config_id;
+                rb->objid = (uint32_t)runtime_id;
+                rb->x = real_x;
+                rb->y = real_y;
+                rb->z = real_z;
+                rb->mx = real_x;
+                rb->mz = real_z;
+                rb->dead = 0;
+            }
