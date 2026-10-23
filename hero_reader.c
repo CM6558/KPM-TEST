@@ -1918,6 +1918,10 @@ static unsigned long gc_base(void)
 static char g_log_path[160] = "/data/local/tmp/hero_log.txt";
 static int g_log_first = 1;
 static char g_log_buf[1024];
+static unsigned long g_log_game_root;
+static unsigned long g_log_actor_mgr;
+static unsigned int g_log_match_seq;
+static int g_log_combat_ready;
 
 static void hr_log(const char *fmt, ...)
 {
@@ -1971,6 +1975,27 @@ static int read_combat_positions(unsigned long game_root, unsigned long gcbase,
     }
     hr_log("[hero-reader] combat: valid=%d", valid);
     return valid;
+}
+
+/* Log match boundaries once instead of inferring them from the 200 ms reader loop. */
+static void hr_log_match_state(unsigned long game_root, unsigned long actor_mgr, int combat_n)
+{
+    if (game_root != g_log_game_root || actor_mgr != g_log_actor_mgr) {
+        g_log_match_seq++;
+        hr_log("[hero-reader] match #%u %s: root=0x%lx actor_mgr=0x%lx",
+               g_log_match_seq, g_log_game_root ? "changed" : "detected",
+               game_root, actor_mgr);
+        g_log_game_root = game_root;
+        g_log_actor_mgr = actor_mgr;
+        g_log_combat_ready = 0;
+    }
+    if (combat_n > 0 && !g_log_combat_ready) {
+        hr_log("[hero-reader] match #%u combat ready: heroes=%d", g_log_match_seq, combat_n);
+        g_log_combat_ready = 1;
+    } else if (combat_n == 0 && g_log_combat_ready) {
+        hr_log("[hero-reader] match #%u combat unavailable", g_log_match_seq);
+        g_log_combat_ready = 0;
+    }
 }
 
 /*
@@ -2125,8 +2150,7 @@ static int read_rootactor_chain(void)
     if (!pool_base || pool_base < 0x100000000UL) return -11;
 
     combat_n = read_combat_positions(game_root, b, combat_ids, combat_x, combat_y, HB_MAXREC);
-    hr_log("[hero-reader] rootactor: gc_base=0x%lx root=0x%lx am=0x%lx count=%u combat=%d",
-           b, game_root, actor_mgr, count, combat_n);
+    hr_log_match_state(game_root, actor_mgr, combat_n);
 
     memset(g_bin_rec, 0, sizeof(g_bin_rec));
 
