@@ -42,6 +42,7 @@ static inline unsigned long untag(unsigned long p) { return p & PTR_MASK; }
 #define KPM_O_WRONLY     01
 #define KPM_O_CREAT      0100
 #define KPM_O_TRUNC      01000
+#define KPM_O_APPEND     02000
 
 #ifndef HR_MOD_NAME
 #define HR_MOD_NAME "hero-reader"
@@ -1913,6 +1914,65 @@ static unsigned long gc_base(void)
     return g_gc_base;
 }
 
+/* Persist the Combat Manager diagnostics outside the volatile kernel log. */
+static char g_log_path[160] = "/data/local/tmp/hero_log.txt";
+static int g_log_first = 1;
+static char g_log_buf[1024];
+
+static void hr_log(const char *fmt, ...)
+{
+    void *f;
+    va_list ap;
+    int len;
+    long long pos = 0;
+
+    if (!p_filp_open || !p_kernel_write || !p_filp_close) return;
+    va_start(ap, fmt);
+    len = vsnprintf(g_log_buf, sizeof(g_log_buf) - 2, fmt, ap);
+    va_end(ap);
+    if (len <= 0) return;
+    if ((unsigned long)len >= sizeof(g_log_buf) - 2) len = sizeof(g_log_buf) - 3;
+    g_log_buf[len++] = '\n';
+    f = p_filp_open(g_log_path, KPM_O_WRONLY | KPM_O_CREAT |
+                    (g_log_first ? KPM_O_TRUNC : KPM_O_APPEND), 0644);
+    if (!f || (unsigned long)f >= (unsigned long)-4095UL) return;
+    g_log_first = 0;
+    p_kernel_write(f, g_log_buf, (unsigned long)len, &pos);
+    p_filp_close(f, NULL);
+}
+
+/* CombatManager stores the authoritative per-hero X/Y positions in 64-byte items. */
+#define COMBAT_MGR_VTABLE_OFF 0x4B7D8B8UL
+
+static int read_combat_positions(unsigned long game_root, unsigned long gcbase,
+                                 int *ids, int *xs, int *ys, int max)
+{
+    unsigned long mgr = 0, vt = 0, begin = 0, end = 0;
+    int count, valid = 0, i;
+
+    if (!rm(&mgr, game_root + 0x4F0UL, 8)) return 0;
+    mgr = untag(mgr);
+    if (mgr < 0x100000000UL || !rm(&vt, mgr, 8) || vt != gcbase + COMBAT_MGR_VTABLE_OFF) return 0;
+    if (!rm(&begin, mgr + 0x4A8UL, 8) || !rm(&end, mgr + 0x4B0UL, 8)) return 0;
+    begin = untag(begin); end = untag(end);
+    if (begin < 0x100000000UL || end < begin) return 0;
+    count = (int)((end - begin) / 64UL);
+    if (count <= 0 || count > 20) return 0;
+    hr_log("[hero-reader] combat: cm=0x%lx list=0x%lx-0x%lx count=%d", mgr, begin, end, count);
+    for (i = 0; i < count && valid < max; i++) {
+        unsigned long item = begin + (unsigned long)i * 64UL;
+        int id = 0, x = 0, y = 0;
+        if (!rm(&id, item, 4) || !rm(&x, item + 4, 4) || !rm(&y, item + 0xCUL, 4)) continue;
+        if (id < 100 || id > 700 || (x == 0 && y == 0) ||
+            x < -3000000 || x > 3000000 || y < -3000000 || y > 3000000) continue;
+        ids[valid] = id; xs[valid] = x / 10; ys[valid] = y / 10;
+        hr_log("[hero-reader] combat item=%d pos=(%d,%d)cm", id, xs[valid], ys[valid]);
+        valid++;
+    }
+    hr_log("[hero-reader] combat: valid=%d", valid);
+    return valid;
+}
+
 /*
  * GameRoot -> CActorManager -> HeroEntry 间接索引池 -> Hero (1008字节)
  * 严格按照 sub_3CFFEF8 与 sub_45ACA90 机器汇编实现
@@ -2023,6 +2083,8 @@ static int read_rootactor_chain(void)
     unsigned long pool_base = 0, index_buf = 0;
     unsigned int flag = 0, count = 0, valid = 0;
     unsigned long count_off = 0;
+    int combat_ids[HB_MAXREC], combat_x[HB_MAXREC], combat_y[HB_MAXREC];
+    int combat_n;
     int i;
 
     if (!g_target_mm) return -1;
@@ -2062,6 +2124,10 @@ static int read_rootactor_chain(void)
     pr_info("[hero-reader] rootactor: flag=%u count=%u pool=0x%lx idx=0x%lx\n", flag, count, pool_base, index_buf);
     if (!pool_base || pool_base < 0x100000000UL) return -11;
 
+    combat_n = read_combat_positions(game_root, b, combat_ids, combat_x, combat_y, HB_MAXREC);
+    hr_log("[hero-reader] rootactor: gc_base=0x%lx root=0x%lx am=0x%lx count=%u combat=%d",
+           b, game_root, actor_mgr, count, combat_n);
+
     memset(g_bin_rec, 0, sizeof(g_bin_rec));
 
     /* Level 4: 查表遍历 (flag==0 时为直接步进 i, flag!=0 时查 index_buf) */
@@ -2097,7 +2163,22 @@ static int read_rootactor_chain(void)
         /* 过滤：王者荣耀英雄ID通常在 100~700 之间 (如105廉颇..585元流之子) */
         if (config_id < 100 || config_id > 700) continue;
 
-        get_actor_coords(hero_ptr, &real_x, &real_y, &real_z);
+        {
+            int j;
+            int matched = 0;
+            for (j = 0; j < combat_n; j++) {
+                if (combat_ids[j] == config_id) {
+                    real_x = combat_x[j];
+                    real_y = combat_y[j];
+                    real_z = 0;
+                    matched = 1;
+                    break;
+                }
+            }
+            if (!matched) get_actor_coords(hero_ptr, &real_x, &real_y, &real_z);
+            hr_log("[hero-reader] hero slot=%d cfg=%d combat=%d pos=(%d,%d)",
+                   slot, config_id, matched, real_x, real_z);
+        }
 
         /* 存活判定: enabled_flag 正常>=1 且 state_code!=1 (死亡态) */
         int is_dead = (enabled_flag < 1 || state_code == 1);
