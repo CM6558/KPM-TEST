@@ -440,103 +440,57 @@ static void hbin_write(void)
     if (old_cred && p_revert_creds) p_revert_creds(old_cred);
 }
 
-static int get_actor_coords(unsigned long actor, int *ox, int *oy, int *oz)
+/* Hero vtable 地址 (构造函数最终写入 hero+0 的值)
+ * 证据: 0x36A2cf4: str x9, [x19]  where x9 = 0x4dacd10
+ * 运行时由 R_AARCH64_RELATIVE 重定位为 gc_base + 0x4dacd10
+ * 用作类型标记: 如果 hero+0 != gc_base + 0x4dacd10 → 不是 Hero 对象 */
+#define HERO_VTABLE_OFF  0x4dacd10UL
+
+static int get_actor_coords(unsigned long actor, unsigned long gcbase,
+                            int *ox, int *oy, int *oz)
 {
-    int xx = 0, yy = 0, zz = 0;
+    int xx = 0, yy = 0;
+    unsigned long vt = 0, vt2 = 0;
+    unsigned long expected_vt = gcbase + HERO_VTABLE_OFF;
 
     /* ============================================================================
-     * 路径 1 (主): hero+0x10 低32位 = X_mm, hero+0x18 = Y_mm
+     * 主路径: hero+0x3e8 (X_mm) + hero+0x3ec (Y_mm)
      *
-     * 服务器权威位置, 所有英雄都有, ViewManager 从不写入此字段。
-     * 证据 (Unicorn + capstone 离线验证):
-     *   - sub_36A2678 每帧设 hero+0x1d = 1, sub_36A2B44 在 flag=1 时
-     *     直接读 hero+0x10 (8字节) + hero+0x18 (4字节) 作为位置发送给渲染层
-     *   - ViewManager (sub_24AEAC0) 只写 55000 到 hero+0x20/+0x28 (隐身敌人)
-     *     永远不碰 hero+0x10/+0x18
-     *   - hero+0x10/+0x18 由物理引擎每帧更新, 所有英雄都有效
-     * ============================================================================
-     */
-    if (rm(&xx, actor + 0x10UL, 4) && rm(&yy, actor + 0x18UL, 4)) {
-        if (xx != 0 || yy != 0) {
-            if (xx >= -3000000 && xx <= 3000000 &&
-                yy >= -3000000 && yy <= 3000000) {
-                *ox = xx / 10;          /* 毫米 → 厘米 */
-                *oy = yy / 10;
-                *oz = 0;
-                return 1;
-            }
-        }
-    }
-
-    /* ============================================================================
-     * 路径 2 (备): hero+0x20 (X_mm) + hero+0x28 (Y_mm)
+     * 这是战斗系统 CanHitTarget (0x2801ae4, GOT@0x509d0b0) 读取的位置源。
+     * CanHitTarget 调用 sub_3AC94A8 距离函数, 距离函数读 *(pos+0) 和 *(pos+8):
+     *   pos1 = actor_struct+0x3e8  (本机英雄位置, 由 sub_25284f0 从 +0x3e8 拷贝)
+     *   pos2 = target+0x4         (目标位置)
      *
-     * 渲染位置, 对可见英雄和己方 = 真实坐标。
-     * ViewManager 仅对隐身敌方英雄写 55000 (阿轲/兰陵王等),
-     * 检测到 55000 → 该英雄当前位置不可读, 跳过。
+     * 战斗系统必须用真实坐标做命中判定, 不能被 ViewManager 混淆。
+     * 55000 (0xD6D8) 只出现在 sub_24AEAC0, 写入 view data entry 而非 Hero 对象。
+     *
+     * VTABLE 校验: 构造函数最终写 0x4dacd10 到 hero+0。
+     *   如果 hero+0 != gc_base + 0x4dacd10 → 对象不是 Hero, 丢弃。
+     *   读完位置后重读 hero+0, 确保中间未被释放/重用。
      * ============================================================================
      */
-    if (rm(&xx, actor + 0x20UL, 4) && rm(&yy, actor + 0x28UL, 4)) {
-        if (xx == 55000 || xx == -55000 || yy == 55000 || yy == -55000)
-            goto fallback_transform;     /* 隐身敌人被混淆, 跳过 */
-        if (xx != 0 || yy != 0) {
-            if (xx >= -3000000 && xx <= 3000000 &&
-                yy >= -3000000 && yy <= 3000000) {
-                *ox = xx / 10;
-                *oy = yy / 10;
-                *oz = 0;
-                return 1;
-            }
-        }
-    }
 
-    /* ============================================================================
-     * 路径 3 (最后): Transform 变换链
-     * hero+0xA8 → Node+0x10 → Link+0x00 → Transform+0x60 → VInt3 (X,Y,Z mm)
-     * seqlock 保障一致性, 仅在 1 和 2 都失败时使用。
-     * ============================================================================
-     */
-fallback_transform:
-    {
-        unsigned long node = 0, link = 0, tr = 0, p2 = 0;
-        unsigned long node2 = 0, link2 = 0;
+    /* 校验 vtable: hero+0 必须等于 gc_base + 0x4dacd10 */
+    if (!rm(&vt, actor, 8)) return 0;
+    if (vt != expected_vt) return 0;
 
-        if (!rm(&node, actor + 0xA8UL, 8)) return 0;
-        node = untag(node);
-        if (node <= 0x100000000UL || node >= 0x800000000000UL) return 0;
+    /* 读位置: hero+0x3e8 = X (mm), hero+0x3ec = Y (mm) */
+    if (!rm(&xx, actor + 0x3e8UL, 4)) return 0;
+    if (!rm(&yy, actor + 0x3ecUL, 4)) return 0;
 
-        if (!rm(&link, node + 0x10UL, 8)) return 0;
-        link = untag(link);
-        if (link <= 0x100000000UL || link >= 0x800000000000UL) return 0;
+    /* seqlock: 重读 vtable 确保对象在读位置期间未被释放 */
+    if (!rm(&vt2, actor, 8)) return 0;
+    if (vt2 != vt) return 0;
 
-        if (!rm(&tr, link + 0x00UL, 8)) return 0;
-        tr = untag(tr);
-        if (tr <= 0x100000000UL || tr >= 0x800000000000UL) return 0;
+    /* 数值合理性: ±30km = ±3,000,000 mm; 零值 = 未初始化 */
+    if (xx == 0 && yy == 0) return 0;
+    if (xx < -3000000 || xx > 3000000) return 0;
+    if (yy < -3000000 || yy > 3000000) return 0;
 
-        if (!rm(&p2, tr + 0x60UL, 8)) return 0;
-        p2 = untag(p2);
-        if (p2 <= 0x100000000UL || p2 >= 0x800000000000UL) return 0;
-
-        rm(&xx, p2 + 0, 4);
-        rm(&yy, p2 + 4, 4);
-        rm(&zz, p2 + 8, 4);
-
-        rm(&node2, actor + 0xA8UL, 8);
-        node2 = untag(node2);
-        if (node2 != node) return 0;
-        rm(&link2, node + 0x10UL, 8);
-        link2 = untag(link2);
-        if (link2 != link) return 0;
-
-        if (xx == 0 && zz == 0) return 0;
-        if (xx < -3000000 || xx > 3000000) return 0;
-        if (zz < -3000000 || zz > 3000000) return 0;
-
-        *ox = xx / 10;
-        *oy = yy / 10;
-        *oz = zz / 10;
-        return 1;
-    }
+    *ox = xx / 10;    /* 毫米 → 厘米 */
+    *oy = yy / 10;
+    *oz = 0;
+    return 1;
 }
 
 /*
@@ -639,7 +593,7 @@ static int read_rootactor_chain(void)
         /* 过滤：王者荣耀英雄ID通常在 100~700 之间 (如105廉颇..585元流之子) */
         if (config_id < 100 || config_id > 700) continue;
 
-        get_actor_coords(hero_ptr, &real_x, &real_y, &real_z);
+        get_actor_coords(hero_ptr, b, &real_x, &real_y, &real_z);
 
         pr_info("[hero-reader]   [#%02d] slot=%d hero=0x%lx cfg=%d camp=%u rt=%d pos=(%d,%d) cm en=%u st=%u grass=%u\n",
                 valid, slot, hero_ptr, config_id, camp_raw, runtime_id, real_x, real_z, enabled_flag, state_code, is_in_grass);
