@@ -673,7 +673,6 @@ static int read_rootactor_chain(void)
                 int bst_sp = 0;
                 int bst_nodes = 0;
                 unsigned long cur_node = 0;
-                int last_key = -1;
                 int dbg_iter = 0;
 
                 hr_log("[hero-reader] combat: cm=0x%lx vt=0x%lx (exp=0x%lx) match=%d",
