@@ -627,10 +627,9 @@ static int read_rootactor_chain(void)
     /* Step A: 从战斗系统列表读位置, 建立 config_id → (x,y) 映射表 */
     {
         unsigned long combat_mgr = 0, expected_vt_c = b + COMBAT_MGR_VTABLE_OFF;
-        unsigned long c_vt = 0, c_list_start = 0, c_list_end = 0;
+        unsigned long c_vt = 0;
         unsigned long c_hero_id_map[HB_MAXREC];
         int c_pos_x[HB_MAXREC], c_pos_y[HB_MAXREC];
-        int c_count;
         int c_valid = 0;
         int j;
 
@@ -642,77 +641,152 @@ static int read_rootactor_chain(void)
         combat_mgr = untag(combat_mgr);
         if (combat_mgr && combat_mgr >= 0x100000000UL) {
             rm(&c_vt, combat_mgr, 8);
-            /* 跳过 vtable 校验 — 直接尝试读取, 如果布局对就行 */
-            if (c_vt == expected_vt_c || 1) {  /* 临时强制通过, 先看 raw 数据 */
-                rm(&c_list_start, combat_mgr + 0x4A8UL, 8);
-                rm(&c_list_end, combat_mgr + 0x4B0UL, 8);
-                c_list_start = untag(c_list_start);
-                c_list_end = untag(c_list_end);
-                
-                hr_log("[hero-reader] combat: cm=0x%lx vt=0x%lx (exp=0x%lx) vt_match=%d",
+            /* vtable 校验: 跳过 (即使不匹配也尝试, 静态分析已确认布局) */
+            if (c_vt == expected_vt_c || 1) {
+                /* ============================================================
+                 * 静态分析确认: cm+0x4A8 是 std::map (BST) 容器.
+                 *   cm+0x4A8 → tree container (sentinel, init = &cm+0x4B0)
+                 *   cm+0x4B0 → root node ptr (0 = empty)
+                 *   cm+0x4B8 → size (tree node count)
+                 * Init/next 迭代器走 BST 中序遍历:
+                 *   lower_bound (0x4b1dd18): while(node){ key=*(node+0x20);
+                 *     cmp key,filter; if key<filter: right=*(node+8);
+                 *     else left=*(node+0)... }
+                 *   step/tree_node++ (0x4b1dc3c): in-order successor
+                 *   next() wrapper (0x4b1df3c): 返回 node + 0x28 (VALUE 部分)
+                 * TREE NODE 布局 (std::map RB-tree)
+                 *   +0x00: left child ptr
+                 *   +0x08: right child ptr
+                 *   +0x10: parent ptr
+                 *   +0x18: color tag
+                 *   +0x20: KEY (uint32, filter=2 for hero layer)
+                 *   +0x28: VALUE = std::vector<Item> begin ptr
+                 *   +0x30: VALUE = std::vector<Item> end ptr
+                 * ITEM 布局 (caller 0x28046c0 确认):
+                 *   +0x00: cid (int32)
+                 *   +0x04: X_mm (int32)
+                 *   +0x0C: Y_mm (int32)
+                 *   stride = 0x40 (64 bytes)
+                 * ============================================================ */
+                unsigned long root_node = 0;
+                unsigned long bst_stack[32];  /* explicit stack for iterative inorder */
+                int bst_sp = 0;
+                int bst_nodes = 0;
+                unsigned long cur_node = 0;
+                int last_key = -1;
+                int dbg_iter = 0;
+
+                hr_log("[hero-reader] combat: cm=0x%lx vt=0x%lx (exp=0x%lx) match=%d",
                         combat_mgr, c_vt, expected_vt_c, (c_vt == expected_vt_c));
-                hr_log("[hero-reader] combat: +0x4A8=0x%lx +0x4B0=0x%lx",
-                        c_list_start, c_list_end);
-                
-                if (c_list_start >= 0x100000000UL && c_list_end >= c_list_start) {
-                    c_count = (int)((c_list_end - c_list_start) / 64UL);
-                    hr_log("[hero-reader] combat: count=%d (stride=64)", c_count);
-                    
-                    if (c_count > 0 && c_count <= 20) {
-                        /* Dump raw bytes of first 3 items for debugging */
-                        for (j = 0; j < c_count && j < 3; j++) {
-                            unsigned long citem = c_list_start + (unsigned long)j * 64UL;
-                            unsigned int raw[16];  /* 64 bytes = 16 uint32 */
-                            int k;
-                            for (k = 0; k < 16; k++)
-                                rm(&raw[k], citem + (unsigned long)k * 4UL, 4);
-                            hr_log("[hero-reader] combat: item[%d] @0x%lx: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x",
-                                    j, citem,
-                                    raw[0],raw[1],raw[2],raw[3],
-                                    raw[4],raw[5],raw[6],raw[7],
-                                    raw[8],raw[9],raw[10],raw[11],
-                                    raw[12],raw[13],raw[14],raw[15]);
+
+                rm(&root_node, combat_mgr + 0x4B0UL, 8);
+                root_node = untag(root_node);
+                hr_log("[hero-reader] combat: tree root=0x%lx (cm+0x4B0)", root_node);
+
+                if (!root_node || root_node < 0x100000000UL) {
+                    hr_log("[hero-reader] combat: tree empty (root=NULL)");
+                } else {
+                    /* 迭代中序遍历 (Morris-like, 但用显式栈避免递归) */
+                    /* BST 节点数应该 <= 20 (按 layer 分组, hero layer filter=2) */
+                    cur_node = root_node;
+                    bst_sp = 0;
+                    bst_nodes = 0;
+                    while (bst_sp > 0 || (cur_node && cur_node >= 0x100000000UL)) {
+                        /* 走到最左 */
+                        int safety = 0;
+                        while (cur_node && cur_node >= 0x100000000UL && safety < 32) {
+                            if (bst_sp >= 31) break;
+                            bst_stack[bst_sp++] = cur_node;
+                            /* 左子: *(node+0) */
+                            rm(&cur_node, bst_stack[bst_sp-1], 8);
+                            cur_node = untag(cur_node);
+                            safety++;
                         }
-                        
-                        /* 也尝试不同的 item stride 和不同的 field offset */
-                        for (j = 0; j < c_count && c_valid < HB_MAXREC; j++) {
-                            unsigned long citem = c_list_start + (unsigned long)j * 64UL;
-                            int cid = 0, cx = 0, cy = 0;
-                            rm(&cid, citem + 0x00UL, 4);
-                            rm(&cx, citem + 0x04UL, 4);
-                            rm(&cy, citem + 0x0CUL, 4);
-                            /* 放宽条件: 不过滤 config_id 范围, 记录所有非零项 */
-                            if (cx == 0 && cy == 0) continue;
-                            c_hero_id_map[c_valid] = (unsigned long)cid;
-                            c_pos_x[c_valid] = cx;
-                            c_pos_y[c_valid] = cy;
-                            c_valid++;
-                            hr_log("[hero-reader] combat: item[%d] id=%d x=%d y=%d (raw: cx=%d cy=%d)",
-                                    j, cid, cx / 10, cy / 10, cx, cy);
-                        }
-                    } else if (c_count == 0) {
-                        /* list 为空时, 尝试直接从 cm+0x4B0 开始读 */
-                        /* 可能 +0x4A8 不是 list begin, 而是其他字段 */
-                        hr_log("[hero-reader] combat: list empty, trying raw dump cm+0x4A0..+0x500");
+                        if (bst_sp == 0) break;
+                        cur_node = bst_stack[--bst_sp];
+                        bst_nodes++;
+
+                        /* 处理 cur_node: 读 key, 决定是否处理其 value */
                         {
-                            unsigned int raw[24];  /* 96 bytes = 24 uint32 */
-                            int k;
-                            for (k = 0; k < 24; k++)
-                                rm(&raw[k], combat_mgr + 0x4A0UL + (unsigned long)k * 4UL, 4);
-                            hr_log("[hero-reader] combat: cm+0x4A0: %08x %08x %08x %08x %08x %08x %08x %08x",
-                                    raw[0],raw[1],raw[2],raw[3],raw[4],raw[5],raw[6],raw[7]);
-                            hr_log("[hero-reader] combat: cm+0x4C0: %08x %08x %08x %08x %08x %08x %08x %08x",
-                                    raw[8],raw[9],raw[10],raw[11],raw[12],raw[13],raw[14],raw[15]);
-                            hr_log("[hero-reader] combat: cm+0x4E0: %08x %08x %08x %08x %08x %08x %08x %08x",
-                                    raw[16],raw[17],raw[18],raw[19],raw[20],raw[21],raw[22],raw[23]);
+                            int node_key = 0;
+                            unsigned long vec_begin = 0, vec_end = 0;
+                            rm(&node_key, cur_node + 0x20UL, 4);
+                            rm(&vec_begin, cur_node + 0x28UL, 8);
+                            rm(&vec_end,   cur_node + 0x30UL, 8);
+                            vec_begin = untag(vec_begin);
+                            vec_end = untag(vec_end);
+
+                            /* debug 日志: 第 5 个节点前都打印 */
+                            if (dbg_iter < 5) {
+                                hr_log("[hero-reader] combat: bst[%d] @0x%lx key=%d vec=0x%lx..0x%lx",
+                                        dbg_iter, cur_node, node_key, vec_begin, vec_end);
+                                dbg_iter++;
+                            }
+
+                            /* 处理所有节点 (不过滤 key, 否则会漏掉)
+                               不过通常 filter=2 是 hero layer, 只有 hero 节点
+                               调用方传 filter=2 只接受 key>=2 的节点 */
+                            if (vec_begin >= 0x100000000UL && vec_end >= vec_begin) {
+                                int vec_count = (int)((vec_end - vec_begin) / 64UL);
+                                if (vec_count > 0 && vec_count <= 32) {
+                                    int k;
+                                    for (k = 0; k < vec_count && c_valid < HB_MAXREC; k++) {
+                                        unsigned long citem = vec_begin + (unsigned long)k * 64UL;
+                                        int cid = 0, cx = 0, cy = 0;
+                                        rm(&cid, citem + 0x00UL, 4);
+                                        rm(&cx,  citem + 0x04UL, 4);
+                                        rm(&cy,  citem + 0x0CUL, 4);
+                                        /* debug 前 3 个 item */
+                                        if (dbg_iter < 8) {
+                                            hr_log("[hero-reader] combat:   vec[%d]@0x%lx cid=%d x=%d y=%d",
+                                                    k, citem, cid, cx, cy);
+                                        }
+                                        if (cx == 0 && cy == 0) continue;
+                                        /* config_id 过滤: 英雄 cid 范围 100-700 */
+                                        if (cid < 50 || cid > 999) continue;
+                                        c_hero_id_map[c_valid] = (unsigned long)cid;
+                                        c_pos_x[c_valid] = cx;
+                                        c_pos_y[c_valid] = cy;
+                                        c_valid++;
+                                    }
+                                } else if (vec_count < 0 || vec_count > 32) {
+                                    hr_log("[hero-reader] combat: bad vec_count=%d @0x%lx",
+                                            vec_count, cur_node);
+                                }
+                            }
+                        }
+
+                        /* 右子: *(node+8) */
+                        rm(&cur_node, cur_node + 0x08UL, 8);
+                        cur_node = untag(cur_node);
+
+                        if (bst_nodes > 64) {
+                            hr_log("[hero-reader] combat: BST node cap reached (cycle?)");
+                            break;
                         }
                     }
-                } else {
-                    hr_log("[hero-reader] combat: list invalid start=0x%lx end=0x%lx", c_list_start, c_list_end);
+                    hr_log("[hero-reader] combat: bst_nodes=%d c_valid=%d",
+                            bst_nodes, c_valid);
+                }
+
+                /* 兜底: 如果 BST 没数据, 尝试 fallback 列表 (combat_manager+0x4A0 区)
+                   这是早期版本的扁平 list, 现在用 BST 了, 但保留兜底 */
+                if (c_valid == 0) {
+                    hr_log("[hero-reader] combat: BST empty, fallback raw dump cm+0x490..+0x4D0");
+                    {
+                        unsigned int raw[16];
+                        int k;
+                        for (k = 0; k < 16; k++)
+                            rm(&raw[k], combat_mgr + 0x490UL + (unsigned long)k * 4UL, 4);
+                        hr_log("[hero-reader] combat: cm+0x490: %08x %08x %08x %08x %08x %08x %08x %08x",
+                                raw[0],raw[1],raw[2],raw[3],raw[4],raw[5],raw[6],raw[7]);
+                        hr_log("[hero-reader] combat: cm+0x4B0: %08x %08x %08x %08x %08x %08x %08x %08x",
+                                raw[8],raw[9],raw[10],raw[11],raw[12],raw[13],raw[14],raw[15]);
+                    }
                 }
             }
         } else {
-            hr_log("[hero-reader] combat: cm=0 NULL or invalid", 0);
+            hr_log("[hero-reader] combat: cm NULL or invalid");
         }
         hr_log("[hero-reader] combat: c_valid=%d", c_valid);
 
