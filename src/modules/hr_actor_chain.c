@@ -642,32 +642,77 @@ static int read_rootactor_chain(void)
         combat_mgr = untag(combat_mgr);
         if (combat_mgr && combat_mgr >= 0x100000000UL) {
             rm(&c_vt, combat_mgr, 8);
-            if (c_vt == expected_vt_c) {
+            /* 跳过 vtable 校验 — 直接尝试读取, 如果布局对就行 */
+            if (c_vt == expected_vt_c || 1) {  /* 临时强制通过, 先看 raw 数据 */
                 rm(&c_list_start, combat_mgr + 0x4A8UL, 8);
                 rm(&c_list_end, combat_mgr + 0x4B0UL, 8);
                 c_list_start = untag(c_list_start);
                 c_list_end = untag(c_list_end);
+                
+                hr_log("[hero-reader] combat: cm=0x%lx vt=0x%lx (exp=0x%lx) vt_match=%d",
+                        combat_mgr, c_vt, expected_vt_c, (c_vt == expected_vt_c));
+                hr_log("[hero-reader] combat: +0x4A8=0x%lx +0x4B0=0x%lx",
+                        c_list_start, c_list_end);
+                
                 if (c_list_start >= 0x100000000UL && c_list_end >= c_list_start) {
                     c_count = (int)((c_list_end - c_list_start) / 64UL);
+                    hr_log("[hero-reader] combat: count=%d (stride=64)", c_count);
+                    
                     if (c_count > 0 && c_count <= 20) {
-                        hr_log("[hero-reader] combat: cm=0x%lx list=0x%lx count=%d",
-                                combat_mgr, c_list_start, c_count);
+                        /* Dump raw bytes of first 3 items for debugging */
+                        for (j = 0; j < c_count && j < 3; j++) {
+                            unsigned long citem = c_list_start + (unsigned long)j * 64UL;
+                            unsigned int raw[16];  /* 64 bytes = 16 uint32 */
+                            int k;
+                            for (k = 0; k < 16; k++)
+                                rm(&raw[k], citem + (unsigned long)k * 4UL, 4);
+                            hr_log("[hero-reader] combat: item[%d] @0x%lx: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x",
+                                    j, citem,
+                                    raw[0],raw[1],raw[2],raw[3],
+                                    raw[4],raw[5],raw[6],raw[7],
+                                    raw[8],raw[9],raw[10],raw[11],
+                                    raw[12],raw[13],raw[14],raw[15]);
+                        }
+                        
+                        /* 也尝试不同的 item stride 和不同的 field offset */
                         for (j = 0; j < c_count && c_valid < HB_MAXREC; j++) {
                             unsigned long citem = c_list_start + (unsigned long)j * 64UL;
                             int cid = 0, cx = 0, cy = 0;
                             rm(&cid, citem + 0x00UL, 4);
                             rm(&cx, citem + 0x04UL, 4);
                             rm(&cy, citem + 0x0CUL, 4);
-                            if (cid < 100 || cid > 700) continue;
+                            /* 放宽条件: 不过滤 config_id 范围, 记录所有非零项 */
                             if (cx == 0 && cy == 0) continue;
                             c_hero_id_map[c_valid] = (unsigned long)cid;
                             c_pos_x[c_valid] = cx;
                             c_pos_y[c_valid] = cy;
                             c_valid++;
+                            hr_log("[hero-reader] combat: item[%d] id=%d x=%d y=%d (raw: cx=%d cy=%d)",
+                                    j, cid, cx / 10, cy / 10, cx, cy);
+                        }
+                    } else if (c_count == 0) {
+                        /* list 为空时, 尝试直接从 cm+0x4B0 开始读 */
+                        /* 可能 +0x4A8 不是 list begin, 而是其他字段 */
+                        hr_log("[hero-reader] combat: list empty, trying raw dump cm+0x4A0..+0x500");
+                        {
+                            unsigned int raw[24];  /* 96 bytes = 24 uint32 */
+                            int k;
+                            for (k = 0; k < 24; k++)
+                                rm(&raw[k], combat_mgr + 0x4A0UL + (unsigned long)k * 4UL, 4);
+                            hr_log("[hero-reader] combat: cm+0x4A0: %08x %08x %08x %08x %08x %08x %08x %08x",
+                                    raw[0],raw[1],raw[2],raw[3],raw[4],raw[5],raw[6],raw[7]);
+                            hr_log("[hero-reader] combat: cm+0x4C0: %08x %08x %08x %08x %08x %08x %08x %08x",
+                                    raw[8],raw[9],raw[10],raw[11],raw[12],raw[13],raw[14],raw[15]);
+                            hr_log("[hero-reader] combat: cm+0x4E0: %08x %08x %08x %08x %08x %08x %08x %08x",
+                                    raw[16],raw[17],raw[18],raw[19],raw[20],raw[21],raw[22],raw[23]);
                         }
                     }
+                } else {
+                    hr_log("[hero-reader] combat: list invalid start=0x%lx end=0x%lx", c_list_start, c_list_end);
                 }
             }
+        } else {
+            hr_log("[hero-reader] combat: cm=0 NULL or invalid", 0);
         }
         hr_log("[hero-reader] combat: c_valid=%d", c_valid);
 
